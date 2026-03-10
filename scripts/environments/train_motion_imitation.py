@@ -104,8 +104,6 @@ def load_motion_interpolated(npz_path: str) -> dict:
     
     T = raw_pyb.shape[0]
     duration = T * frame_dt
-    
-    print(joint_pos, joint_pos[0])
 
     # 1. Append the first frame to the very end to create a closed loop
     joint_pos_looped = np.vstack((joint_pos, joint_pos[0]))
@@ -431,7 +429,6 @@ def motion_tracking_reward(joint_pos: torch.Tensor,
     diff = joint_pos - q_ref  # (N, 12)
     sq_dist = (diff ** 2).sum(dim=-1)  # (N,)
     track_rew = torch.exp(-sq_dist / (sigma ** 2))  # (N,)
-
 
     if vel_reward is not None:
         track_rew += vel_weight * vel_reward.clamp(0) 
