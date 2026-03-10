@@ -68,3 +68,26 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Isaac-Velocity-Custom-Anymal-D-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.imitation_env_cfg:AnymalDImitationEnvCfg", # Path to your env_cfg.py class
+        # NOTE: no rsl_rl configuration available yet
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_imitatiom_ppo_cfg.yaml", # Path to your SKRL agent config
+    },
+)
+
+# === WORK IN PROGRESS ===
+gym.register(
+    id="Isaac-Velocity-Custom-Anymal-D-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.imitation_env_cfg:AnymalDImitationEnvCfg", # Path to your env_cfg.py class
+        # NOTE: no rsl_rl configuration available yet
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_imitatiom_ppo_cfg.yaml", # Path to your SKRL agent config
+    },
+)

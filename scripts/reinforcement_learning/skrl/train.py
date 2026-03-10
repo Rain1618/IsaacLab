@@ -231,7 +231,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.agent.load(resume_path)
 
     # run training
-    runner.run()
+    runner.run() 
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 

@@ -160,3 +160,4 @@ def illegal_contact(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: SceneE
     return torch.any(
         torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > threshold, dim=1
     )
+

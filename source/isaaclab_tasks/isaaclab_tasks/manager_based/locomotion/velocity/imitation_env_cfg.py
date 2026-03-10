@@ -1,3 +1,4 @@
+
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
@@ -37,7 +38,7 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
 
 
 @configclass
-class MySceneCfg(InteractiveSceneCfg):
+class ImitationSceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
 
     # ground terrain
@@ -128,11 +129,9 @@ class ObservationsCfg:
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        #12
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
         actions = ObsTerm(func=mdp.last_action)
-        #48
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -143,7 +142,6 @@ class ObservationsCfg:
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
-
 
     # observation groups
     policy: PolicyCfg = PolicyCfg()
@@ -276,24 +274,15 @@ class TerminationsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
 
-    # pos_tracking_error = DoneTerm(
-    #     func=mdp.bad_orientation,
-    #     params={
-    #         "limit_angle": math.pi / 2,
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #     }
-    # )
-
-    # fall_error = DoneTerm(
-    #     func = mdp.root_height_below_minimum,
-    #     params={
-    #         "minimum_height": 0.2
-    #     }
-    # )
 
 @configclass
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
+
+    """
+    NOTE: The curriculum should gradually get harder with non-terrain. For example, we should loosen the closeness
+          of the imitation to allow the robot more freedom in RL.
+    """
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
@@ -308,7 +297,7 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
     # Scene settings
-    scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: ImitationSceneCfg = ImitationSceneCfg(num_envs=1024, env_spacing=5.0)   # Default config: num_envs=4096, env_spacing=2.5
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -344,4 +333,6 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
         else:
             if self.scene.terrain.terrain_generator is not None:
                 self.scene.terrain.terrain_generator.curriculum = False
+
+
 
