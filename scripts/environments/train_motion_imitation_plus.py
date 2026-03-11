@@ -307,51 +307,27 @@ def compute_reward(
 
 import copy
 import isaaclab.sim as sim_utils
+from isaaclab_tasks.manager_based.locomotion.velocity.config.anymal_d.imitation_env_cfg import AnymalDImitationFlatEnvCfg
 
 # om isaaclab.sim.materials import OmniSurfaceCfg
 
 def make_env(num_envs):
-    env_cfg = parse_env_cfg(task_name=args_cli.task, device="cuda:0", num_envs=num_envs)
+    env_cfg = AnymalDImitationFlatEnvCfg()
+
+    env_cfg.scene.num_envs = num_envs
+    env_cfg.sim.device = "cuda:0"
     
-    # 1. Main Robot Actuators
     dc_cfg = DCMotorCfg(
         joint_names_expr=[".*HAA", ".*HFE", ".*KFE"],
         saturation_effort=120.0, effort_limit=80.0, velocity_limit=7.5,
         stiffness={".*": args_cli.stiffness},
         damping={".*": args_cli.damping},
     )
+
     env_cfg.scene.robot = env_cfg.scene.robot.replace(actuators={"legs": dc_cfg})
 
-    # 2. Add Shadow Robot Configuration
-    shadow_cfg = copy.deepcopy(env_cfg.scene.robot)
-    shadow_cfg.prim_path = "{ENV_REGEX_NS}/ShadowRobot"
-    
-    # Make it kinematic and disable collisions
-    shadow_cfg.spawn.rigid_props = sim_utils.RigidBodyPropertiesCfg(
-        kinematic_enabled=True,
-        disable_gravity=True
-    )
-    shadow_cfg.spawn.collision_props = sim_utils.CollisionPropertiesCfg(
-        collision_enabled=False
-    )
-    
-    # Add transparent material for the shadow
-    # ghost_material_cfg = OmniSurfaceCfg(
-    #     # Diffuse reflectivity set to bright green (R=0, G=1, B=0)
-    #     diffuse_reflection_color=(0.0, 1.0, 0.0), 
-    #     # Make the material slightly glow for better visibility in dim scenes
-    #     enable_emission=True, 
-    #     emission_color=(0.0, 1.0, 0.0),
-    #     # Set opacity for transparency (30% opaque, 70% transparent)
-    #     opacity=0.3, 
-    # )
-
-    # shadow_cfg.spawn.visual_material = ghost_material_cfg
-
-    # Add to the scene
-    env_cfg.scene.shadow_robot = shadow_cfg
-
     return gym.make(args_cli.task, cfg=env_cfg)
+
 
 def init_to_motion(env, clip, phase_t, device):
     robot = env.unwrapped.scene["robot"]
@@ -398,16 +374,17 @@ def print_obs_info(obs):
         print(f"[obs_info] Observation tensor: shape={obs.shape}")
 
 
-def update_shadow_robot(env, clip, phase_t, device):
+def update_shadow_robot(env, clip, phase_t, device, z_offset=1.5):
     """Updates the shadow robot to follow the real robot's base but use reference joints."""
-    if "shadow_robot" not in env.unwrapped.scene.keys():
+    if "ghost_robot" not in env.unwrapped.scene.keys():
         return
-        
+    
     robot = env.unwrapped.scene["robot"]
-    shadow = env.unwrapped.scene["shadow_robot"]
+    ghost = env.unwrapped.scene["ghost_robot"]
 
     # 1. Base pose: match the real robot exactly
     root_state = robot.data.root_state_w.clone()
+    root_state[:, 2] += z_offset
 
     # 2. Joint positions: match the reference motion exactly
     q_ref_np, v_ref_np = get_ref_batch(clip, phase_t)
@@ -415,9 +392,9 @@ def update_shadow_robot(env, clip, phase_t, device):
     v_ref = torch.tensor(v_ref_np, dtype=torch.float32, device=device)
 
     # 3. Write directly to simulation buffers
-    shadow.write_root_state_to_sim(root_state)
+    ghost.write_root_state_to_sim(root_state)
     jids = env.unwrapped.action_manager._terms["joint_pos"]._joint_ids
-    shadow.write_joint_state_to_sim(q_ref, v_ref, joint_ids=jids)
+    ghost.write_joint_state_to_sim(q_ref, v_ref, joint_ids=jids)
 
 
 def collect_bc_data(env, clip, device):
