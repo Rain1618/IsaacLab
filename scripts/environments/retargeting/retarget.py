@@ -1,16 +1,12 @@
-from __future__ import annotations
+
 import argparse
-import os
-import time
-import json
-import pickle
-from dataclasses import dataclass, field
-from pathlib import Path
+
+import time 
+import torch
 
 import numpy as np
+from pathlib import Path
 
-import torch
- 
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.assets import Articulation, ArticulationCfg  # noqa: E402
 from isaaclab.controllers import (  # noqa: E402
@@ -30,122 +26,85 @@ from isaaclab.utils.math import (  # noqa: E402
     subtract_frame_transforms,
 )
 
-from .helpers import *
+from .helpers import ROBOT_META, get_robot_cfg, compute_scale_factors, load_reference_motion, RetargetSceneCfg, QuadrupedRetargeter
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
 
-ROBOT_META = {
-    "anymal_d": {
-        "foot_bodies": ["LF_FOOT", "RF_FOOT", "LH_FOOT", "RH_FOOT"],
-        "leg_roots": ["LF_HIP", "RF_HIP", "LH_HIP", "RH_HIP"],
-        "joint_names": [
-            "LF_HAA", "LF_HFE", "LF_KFE",
-            "RF_HAA", "RF_HFE", "RF_KFE",
-            "LH_HAA", "LH_HFE", "LH_KFE",
-            "RH_HAA", "RH_HFE", "RH_KFE",
-        ],
-        "default_joint_pos": [
-            0.0, 0.4, -0.8,
-            0.0, 0.4, -0.8,
-            0.0, -0.4, 0.8,
-            0.0, -0.4, 0.8,
-        ],
-        "leg_length": 0.55,
-        "base_height": 0.55,
-    }
-}
-
-
-def load_reference_motion(path: str, fps: float) -> ReferenceMotion:
-    """Load a reference motion file and return a ReferenceMotion object.
- 
-    Supported raw formats
-    ---------------------
-    .npz / .npy : numpy archive with the keys described in ReferenceMotion
-    .pkl        : pickled dict with the same keys
-    .json       : JSON dict with the same keys (lists → numpy arrays)
-    """
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Reference motion not found: {path}")
- 
-    ext = p.suffix.lower()
-    if ext == ".npz":
-        data = dict(np.load(path, allow_pickle=True))
-    elif ext in (".pkl", ".pickle"):
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-    elif ext == ".json":
-        with open(path) as f:
-            raw = json.load(f)
-        data = {k: np.array(v) for k, v in raw.items()}
-    else:
-        raise ValueError(f"Unsupported reference motion format: {ext!r}")
- 
-    def _get(key, required=True):
-        val = data.get(key)
-        if val is None and required:
-            raise KeyError(
-                f"Required key '{key}' missing from reference motion file.\n"
-                f"Available keys: {list(data.keys())}"
-            )
-        return np.asarray(val, dtype=np.float32) if val is not None else None
- 
-    root_pos  = _get("root_pos")           # (T, 3)
-    root_rot  = _get("root_rot")           # (T, 4) wxyz
-    foot_pos  = _get("foot_pos")           # (T, 4, 3)
-    root_lin_vel = _get("root_lin_vel", required=False)
-    root_ang_vel = _get("root_ang_vel", required=False)
- 
-    T = root_pos.shape[0]
-    assert root_rot.shape  == (T, 4),    f"root_rot must be (T,4), got {root_rot.shape}"
-    assert foot_pos.shape  == (T, 4, 3), f"foot_pos must be (T,4,3), got {foot_pos.shape}"
- 
-    # Compute velocities by finite-difference if not provided
-    dt = 1.0 / fps
-    if root_lin_vel is None:
-        root_lin_vel = np.gradient(root_pos, dt, axis=0).astype(np.float32)
-    if root_ang_vel is None:
-        # Approximate angular velocity from quaternion derivative
-        root_ang_vel = _quat_to_angular_velocity(root_rot, dt)
- 
-    print(
-        f"[Loader] Loaded '{p.name}' — {T} frames @ {fps} Hz "
-        f"({T/fps:.1f} s)."
+    p.add_argument(
+        "--ref-motion", 
+        type=str,
+        required=True
     )
-    return ReferenceMotion(
-        root_pos=root_pos,
-        root_rot=root_rot,
-        foot_pos=foot_pos,
-        root_lin_vel=root_lin_vel,
-        root_ang_vel=root_ang_vel,
-        dt=dt,
+    p.add_argument(
+        "--output", 
+        type=str,
+        required=True
+    )
+    p.add_argument(
+        "--physics_dt",
+        type=float,
+        default=1.0 / 200.0
+    )
+    p.add_argument(
+        "--ik_damping",
+        type=float,
+        default=0.05
     )
     
+    # IsaacLab simulation arguments
+    p.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help="Number of parallel simulation environments (default: 1).",
+    )
+    p.add_argument("--headless", action="store_true", default=False)
+    p.add_argument("--device", type=str, default="cuda:0")
     
+    return p
+
+# -- Parse early so IsaacLab Launcher sees the sys.argv
+parser = _build_arg_parser()
+
+from isaaclab.app import AppLauncher  # noqa: E402  (import after argparse setup)
+ 
+AppLauncher.add_app_launcher_args(parser)
+args, _ = parser.parse_known_args()
+ 
+# Launch the simulation application (headless unless --visualise requested)
+args.headless = not args.visualise
+app_launcher = AppLauncher(args)
+simulation_app = app_launcher.app
+
 @configclass
 class RetargetSceneCfg(InteractiveSceneCfg):
     """Minimal scene: ground plane + robot."""
     ground = sim_utils.GroundPlaneCfg()
-    robot: ArticulationCfg = None    # filled at runtimes
+    robot: ArticulationCfg = None    # filled at runtime
+
+# Main function to run that invokes the Isaac AppLauncher
+def run_targeting(args) -> None:
+    """Main execution function which starts AppLauncher and performs motion retargeting
     
-    
-def run_retargeting(args) -> None:
-    """Full pipeline: load → scene → IK solve → save."""
- 
+    Keyword arguments:
+    args -- arguments from the CLI execution runtime, TODO: add schema for the dict obj
+    Return: None
+    """
     device = args.device
     num_envs = args.num_envs
  
-    # ── (a) Load reference motion ─────────────────────────────────────────────
+    # Load reference motion
     ref = load_reference_motion(args.ref_motion, args.fps)
     T   = ref.root_pos.shape[0]
  
-    # ── (b) Retrieve robot metadata ───────────────────────────────────────────
+    # Retrieve robot metadata
     meta = ROBOT_META[args.robot]
  
-    # ── (c) Compute animal→robot scale factors ────────────────────────────────
+    # Compute animal-to-robot scale factors
     scale = compute_scale_factors(ref, meta)
  
-    # ── (d) Scale reference root & foot positions ─────────────────────────────
+    # Scale reference root & foot positions
     scaled_root_pos = ref.root_pos.copy()
     scaled_root_pos[:, 2] = (
         (ref.root_pos[:, 2] - ref.root_pos[:, 2].min())
@@ -163,7 +122,7 @@ def run_retargeting(args) -> None:
             0.05,
         )
  
-    # ── (e) Build IsaacLab simulation ─────────────────────────────────────────
+    # Build IsaacLab simulation
     sim_cfg = sim_utils.SimulationCfg(
         dt=args.physics_dt,
         render_interval=1 if args.visualise else 4,
@@ -173,7 +132,7 @@ def run_retargeting(args) -> None:
     sim.set_camera_view(eye=[2.0, 2.0, 2.0], target=[0.0, 0.0, 0.5])
  
     # Scene
-    robot_cfg = _get_robot_cfg(args.robot)
+    robot_cfg = get_robot_cfg(args.robot)
     scene_cfg = RetargetSceneCfg(num_envs=num_envs, env_spacing=2.0)
     scene_cfg.robot = robot_cfg
     scene = InteractiveScene(scene_cfg)
@@ -187,7 +146,7 @@ def run_retargeting(args) -> None:
     sim.reset()
     robot: Articulation = scene["robot"]
  
-    # ── (f) Instantiate retargeter ────────────────────────────────────────────
+    # Instantiate retargeter
     retargeter = QuadrupedRetargeter(
         robot        = robot,
         meta         = meta,
@@ -198,7 +157,7 @@ def run_retargeting(args) -> None:
         num_envs     = num_envs,
     )
  
-    # ── (g) Allocate output arrays ────────────────────────────────────────────
+    # Allocate output arrays
     out_root_pos      = np.zeros((T, 3),   dtype=np.float32)
     out_root_rot      = np.zeros((T, 4),   dtype=np.float32)
     out_root_lin_vel  = np.zeros((T, 3),   dtype=np.float32)
@@ -207,7 +166,7 @@ def run_retargeting(args) -> None:
     out_joint_vel     = np.zeros((T, 12),  dtype=np.float32)
     out_foot_pos      = np.zeros((T, 4, 3),dtype=np.float32)
  
-    # ── (h) Frame-by-frame IK solve ───────────────────────────────────────────
+    # Frame-by-frame IK solve
     print(f"\n[Retarget] Processing {T} frames on {device} ...")
     t_start = time.time()
  
@@ -260,10 +219,10 @@ def run_retargeting(args) -> None:
     print(f"\n[Retarget] Done — {T} frames in {elapsed_total:.1f}s "
           f"({T/elapsed_total:.1f} frames/s).")
  
-    # ── (i) Compute joint accelerations by finite difference ──────────────────
+    # Compute joint accelerations by finite difference
     out_joint_acc = np.gradient(out_joint_vel, ref.dt, axis=0).astype(np.float32)
  
-    # ── (j) Save retargeted trajectory ───────────────────────────────────────
+    # Save retargeted trajectory 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -276,7 +235,6 @@ def run_retargeting(args) -> None:
         # Joint state
         joint_pos    = out_joint_pos,     # (T, 12)
         joint_vel    = out_joint_vel,     # (T, 12)
-        joint_acc    = out_joint_acc,     # (T, 12)
         # Foot positions (in world frame)
         foot_pos     = out_foot_pos,      # (T, 4, 3)
         # Metadata
@@ -287,5 +245,11 @@ def run_retargeting(args) -> None:
         dt           = np.array([ref.dt]),
     )
  
-    print(f"[Retarget] Saved retargeted trajectory → '{out_path}'")
-    _print_summary(out_path, out_joint_pos, out_joint_vel, meta)
+    print(f"[Retarget] Saved retargeted trajectory → '{out_path}'")    
+    
+    
+if __name__ == "__main__":
+    try:
+        run_targeting(args)
+    finally:
+        simulation_app.close()
