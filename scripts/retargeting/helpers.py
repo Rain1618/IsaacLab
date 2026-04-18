@@ -254,20 +254,26 @@ class QuadrupedRetargeter:
         for leg_i in range(4):
             leg_names = meta["joint_names"][leg_i * 3: leg_i * 3 + 3]
             self.leg_joint_ids.append([all_joint_names.index(name) for name in leg_names])
+
         self.foot_body_ids = [all_body_names.index(name) for name in meta["foot_bodies"]]
 
-        default_map = meta["default_joint_pos"]
+        default_map: dict = meta["default_joint_pos"]
+
+        # self note: qpos means generalized position vector
+        # naming scheme from mujoco
         self.default_qpos = self.robot.data.default_joint_pos.clone()
         for joint_name, value in default_map.items():
             joint_id = all_joint_names.index(joint_name)
             self.default_qpos[:, joint_id] = float(value)
 
     def _flush_state(self, joint_pos: torch.Tensor, joint_vel: torch.Tensor | None = None) -> None:
+        # Write data to the sim from tensor buffer
         if joint_vel is None:
             joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel)
-        if hasattr(self.scene, "write_data_to_sim"):
-            self.scene.write_data_to_sim()
+       
+        # Run one timestep and update physics engine
+        self.scene.write_data_to_sim()
         self.sim.step()
         self.scene.update(self.physics_dt)
         self.robot.update(self.physics_dt)
@@ -287,11 +293,12 @@ class QuadrupedRetargeter:
         # rp: root_pos
         # rr: root_rot
         # expand all the positions to the number of environments
+        # note that rp, rr are both in world coordinates otherwise they would just be 0
         rp = torch.tensor(root_pos, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
         rr = torch.tensor(root_rot, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
         foot_local = torch.tensor(foot_pos_local, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1, -1)
 
-        # Te;e[prts the roots into the simulation 
+        # Teleports the roots into the simulation 
         self._teleport_base(rp, rr)
 
         # flush the state by writing the data to sim and running one timestep update
@@ -308,6 +315,7 @@ class QuadrupedRetargeter:
                 foot_id = self.foot_body_ids[leg_i]
                 body_idx = foot_id - 1 if self.is_fixed_base else foot_id
 
+                # get the end-effector pose in the world frame -> base frame
                 ee_pos_w = self.robot.data.body_pos_w[:, foot_id, :]
                 ee_quat_w = self.robot.data.body_quat_w[:, foot_id, :]
                 ee_pos_b, ee_quat_b = subtract_frame_transforms(rp, rr, ee_pos_w, ee_quat_w)

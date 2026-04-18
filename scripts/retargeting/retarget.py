@@ -87,6 +87,8 @@ def build_scaled_targets(ref, meta: dict, scale: dict, height_offset: float) -> 
 
     foot_local_ref = world_to_local_points(ref.root_pos, root_rot, ref.foot_pos)
 
+    print(scale["x"], scale["y"], scale["z"])
+
     # already smoothed
     foot_local_scaled = foot_local_ref.copy()
     foot_local_scaled[..., 0] *= scale["x"]
@@ -152,9 +154,10 @@ def run_targeting(args) -> None:
     robot.update(args.physics_dt)
 
     if args.visualise:
-        marker_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/foot_targets")
-        marker_cfg.markers["frame"].scale = (0.05, 0.05, 0.05)
-        foot_markers = VisualizationMarkers(marker_cfg)
+        frame_marker_cfg = FRAME_MARKER_CFG.copy()
+        foot_marker_cfg = frame_marker_cfg.replace(prim_path="/Visuals/foot_targets")
+        foot_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+        foot_markers = VisualizationMarkers(foot_marker_cfg)
     else:
         foot_markers = None
 
@@ -195,6 +198,7 @@ def run_targeting(args) -> None:
             out_foot_pos[t, leg_i] = robot.data.body_pos_w[0, foot_id].detach().cpu().numpy()
 
         if foot_markers is not None:
+            print(f"[Retarget] Visualizing foot markers")
             foot_markers.visualize(translations=torch.tensor(scaled_foot_pos_world[t], device=device, dtype=torch.float32))
             sim.render()
 
@@ -212,8 +216,6 @@ def run_targeting(args) -> None:
         str(out_path),
         root_pos=out_root_pos,
         root_rot=out_root_rot,
-        root_lin_vel=out_root_lin_vel,
-        root_ang_vel=out_root_ang_vel,
         joint_pos_isaac=out_joint_pos,
         joint_vel=out_joint_vel,
         joint_acc=out_joint_acc,
