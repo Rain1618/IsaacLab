@@ -11,14 +11,18 @@ from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.scene import InteractiveScene
 from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.managers import SceneEntityCfg
 
 from isaaclab_assets.robots.anymal import ANYMAL_D_CFG  # type: ignore
 
 
 def get_robot_cfg(robot_name: str) -> ArticulationCfg:
+    """Simple validation method for checks"""
     if robot_name != "anymal_d":
         raise ValueError(f"Unsupported robot: {robot_name!r}")
-    return ANYMAL_D_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    
+    robot_cfg: ArticulationCfg = ANYMAL_D_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    return robot_cfg
 
 
 ROBOT_META = {
@@ -280,12 +284,17 @@ class QuadrupedRetargeter:
         dev = self.device
         E = self.num_envs
 
+        # rp: root_pos
+        # rr: root_rot
+        # expand all the positions to the number of environments
         rp = torch.tensor(root_pos, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
         rr = torch.tensor(root_rot, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
         foot_local = torch.tensor(foot_pos_local, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1, -1)
 
+        # Te;e[prts the roots into the simulation 
         self._teleport_base(rp, rr)
 
+        # flush the state by writing the data to sim and running one timestep update
         jpos = self.default_qpos.clone()
         jvel = torch.zeros_like(jpos)
         self._flush_state(jpos, jvel)
@@ -319,6 +328,7 @@ class QuadrupedRetargeter:
             self._flush_state(jpos, jvel)
 
         self.robot.update(self.physics_dt)
+        
         return (
             jpos[0].detach().cpu().numpy().astype(np.float32),
             self.robot.data.joint_vel[0].detach().cpu().numpy().astype(np.float32),

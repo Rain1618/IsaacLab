@@ -60,6 +60,10 @@ class RetargetSceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(
         prim_path="/World/defaultGroundPlane",
         spawn=sim_utils.GroundPlaneCfg(),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.05)),
+    )
+    dome_light = AssetBaseCfg(
+        prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
     robot: ArticulationCfg = None
 
@@ -82,20 +86,20 @@ def build_scaled_targets(ref, meta: dict, scale: dict, height_offset: float) -> 
     root_rot = ensure_quaternion_continuity(ref.root_rot)
 
     foot_local_ref = world_to_local_points(ref.root_pos, root_rot, ref.foot_pos)
-    foot_local_ref = smooth_signal(foot_local_ref, window=7)
 
+    # already smoothed
     foot_local_scaled = foot_local_ref.copy()
     foot_local_scaled[..., 0] *= scale["x"]
     foot_local_scaled[..., 1] *= scale["y"]
     foot_local_scaled[..., 2] *= scale["z"]
     foot_local_scaled[..., 2] = np.clip(foot_local_scaled[..., 2], -meta["leg_length"] * 1.05, -0.02)
 
-    root_pos_xy = smooth_signal(ref.root_pos[:, :2], window=9)
     scaled_root_pos = np.zeros_like(ref.root_pos, dtype=np.float32)
-    scaled_root_pos[:, :2] = root_pos_xy
+    scaled_root_pos[:, :2] = ref.root_pos[:, :2]
     scaled_root_pos[:, 2] = meta["base_height"] + float(height_offset)
 
     scaled_foot_pos_world = local_to_world_points(scaled_root_pos, root_rot, foot_local_scaled)
+
     return scaled_root_pos.astype(np.float32), root_rot.astype(np.float32), scaled_foot_pos_world.astype(np.float32)
 
 
@@ -141,6 +145,8 @@ def run_targeting(args) -> None:
     scene = InteractiveScene(scene_cfg)
     sim.reset()
 
+    print(f"\n[INFO] Setup Complete...")
+
     robot: Articulation = scene["robot"]
     scene.update(args.physics_dt)
     robot.update(args.physics_dt)
@@ -164,14 +170,14 @@ def run_targeting(args) -> None:
         num_envs=num_envs,
     )
 
+    # get the total timesteps from inferring the horizontal length of the arr
     T = ref.root_pos.shape[0]
     isaac_joint_names = list(robot.joint_names)
     isaac_default = retargeter.default_qpos[0].detach().cpu().numpy().astype(np.float32)
 
     out_root_pos = scaled_root_pos.astype(np.float32)
     out_root_rot = scaled_root_rot.astype(np.float32)
-    out_root_lin_vel = np.gradient(out_root_pos, ref.dt, axis=0).astype(np.float32)
-    out_root_ang_vel = ref.root_ang_vel.astype(np.float32)
+    
     out_joint_pos = np.zeros((T, len(isaac_joint_names)), dtype=np.float32)
     out_foot_pos = np.zeros((T, 4, 3), dtype=np.float32)
 

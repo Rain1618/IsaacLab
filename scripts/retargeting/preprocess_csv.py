@@ -174,49 +174,15 @@ def extract_foot_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
     return np.stack([xyz(keypoints[n]) for n in FOOT_NAMES], axis=1).astype(np.float32)
 
 
-def finite_diff_velocity(pos: np.ndarray, dt: float) -> np.ndarray:
-    return np.gradient(pos, dt, axis=0).astype(np.float32)
-
-
-def quat_mul_batch(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-    return np.stack(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        axis=-1,
-    ).astype(np.float32)
-
-
-def quat_to_angular_velocity(quats: np.ndarray, dt: float) -> np.ndarray:
-    q = ensure_quaternion_continuity(quats)
-    q0 = q[:-1]
-    q1 = q[1:]
-    q0_conj = q0.copy()
-    q0_conj[:, 1:] *= -1.0
-    qr = quat_mul_batch(q1, q0_conj)
-    omega = np.zeros((len(q), 3), dtype=np.float32)
-    omega[1:] = 2.0 * qr[:, 1:] / dt
-    if len(q) > 1:
-        omega[0] = omega[1]
-    return smooth_series(omega, window=7)
-
-
 def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float = 0.5) -> None:
     dt = 1.0 / fps
     keypoints = parse_mocap_csv(csv_path)
     keypoints = smooth_low_confidence(keypoints, threshold=lh_threshold)
     keypoints = temporal_smooth_keypoints(keypoints, window=7)
 
-    root_pos = smooth_series(estimate_root_pos(keypoints), window=9)
+    root_pos = smooth_series(estimate_root_pos(keypoints), window=5)
     root_rot = estimate_root_rot(keypoints)
-    foot_pos = smooth_series(extract_foot_positions(keypoints), window=7)
-    root_lin_vel = smooth_series(finite_diff_velocity(root_pos, dt), window=7)
-    root_ang_vel = quat_to_angular_velocity(root_rot, dt)
+    foot_pos = smooth_series(extract_foot_positions(keypoints), window=5)
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,8 +191,6 @@ def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float 
         root_pos=root_pos.astype(np.float32),
         root_rot=root_rot.astype(np.float32),
         foot_pos=foot_pos.astype(np.float32),
-        root_lin_vel=root_lin_vel.astype(np.float32),
-        root_ang_vel=root_ang_vel.astype(np.float32),
         fps=np.array([fps], dtype=np.float32),
         dt=np.array([dt], dtype=np.float32),
     )
