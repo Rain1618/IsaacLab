@@ -318,6 +318,7 @@ def compute_scale_factors(root_pos: np.ndarray,
     thigh_local = world_to_local_points(root_pos, root_rot, thigh_pos, quat_order=quat_order)
     lat_animal = float(np.mean(np.abs(thigh_local[:, 0, 1] - thigh_local[:, 1, 1])))
     lon_animal = float(np.mean(np.abs(thigh_local[:, 0, 0] - thigh_local[:, 2, 0])))
+
     mean_foot_h = foot_pos[:, :, 2].mean(axis=1)
     base_h_animal = float(np.median(root_pos[:, 2] - mean_foot_h))
 
