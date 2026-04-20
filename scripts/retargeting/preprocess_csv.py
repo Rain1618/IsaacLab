@@ -1,5 +1,5 @@
 """
-preprocess_csv_fixed.py — Convert animal motion-capture CSV to retargeting-ready .npz
+preprocess_csv.py — Convert animal motion-capture CSV to retargeting-ready .npz
 
 Coordinate convention
 ---------------------
@@ -33,6 +33,13 @@ FOOT_NAMES = [
     "front_right_paw",
     "back_left_paw",
     "back_right_paw",
+]
+
+THIGH_NAMES = [
+    "front_left_thai",
+    "front_right_thai",
+    "back_left_thai",
+    "back_right_thai",
 ]
 
 TRUNK_NAMES = ["neck_base", "back_middle", "back_end"]
@@ -140,12 +147,30 @@ def temporal_smooth_keypoints(keypoints: dict[str, np.ndarray], window: int = 7)
 
 
 def estimate_root_pos(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    """Root position in IsaacLab z-up frame.
+
+    The (x, y) components are the trunk centroid (mean of neck_base,
+    back_middle, back_end). The z component is overridden with the mean
+    height of the four thigh keypoints, i.e.
+
+        root_z(t) = (1/4) * sum_{i in thighs} p^(i)_z(t),
+
+    so the root tracks the hip plane rather than sitting on the spine.
+    This keeps the root at a retargeting-friendly height (close to the
+    robot's base link) while preserving the horizontal trajectory from
+    the trunk.
+    """
     trunk_xyz = np.stack([xyz(keypoints[n]) for n in TRUNK_NAMES], axis=1)
-    return trunk_xyz.mean(axis=1).astype(np.float32)
+    root = trunk_xyz.mean(axis=1)                                   # (T, 3)
+
+    thigh_xyz = np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1)
+    root[:, 2] = thigh_xyz[:, :, 2].mean(axis=1)                    # override z
+
+    return root.astype(np.float32)
 
 
 def _safe_normalize(v: np.ndarray) -> np.ndarray:
-    return v / np.clip(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8, None)
+    return v / np.clip(np.linalg.norm(v, axis=-1, keepdims=True), 1e-9, None)
 
 
 def _rotmat_to_quat_batch(R: np.ndarray) -> np.ndarray:
@@ -195,41 +220,315 @@ def ensure_quaternion_continuity(quats: np.ndarray) -> np.ndarray:
     return q
 
 
-def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
-    """Build a body frame in IsaacLab convention: x-forward, y-left, z-up.
+def mean_quaternion(quats: np.ndarray) -> np.ndarray:
+    """Compute the mean orientation of a set of unit quaternions.
 
-    Because keypoints were rotated into z-up at parse time, the construction
-    below yields a proper z-up rotation matrix without any further changes.
+    Uses the eigenvalue method of Markley et al. (2007). Given unit
+    quaternions q_1, ..., q_T (rows of `quats`), forms the 4x4 symmetric
+    accumulator
+
+        M = (1/T) * sum_t q_t q_t^T,
+
+    and returns the unit eigenvector of M corresponding to the largest
+    eigenvalue. This is the rotation that minimises the sum of squared
+    chordal distances on S^3 and is invariant to the sign of each q_t
+    (since q q^T == (-q)(-q)^T), sidestepping the hemisphere ambiguity.
+
+    Args:
+        quats: Array of shape (T, 4) with quaternions in (w, x, y, z) order.
+
+    Returns:
+        Array of shape (4,), unit-norm, representing the mean rotation.
     """
-    neck = xyz(keypoints["neck_base"])
-    back = xyz(keypoints["back_end"])
-    lhip = xyz(keypoints["front_left_thai"])
-    rhip = xyz(keypoints["front_right_thai"])
+    assert quats.ndim == 2 and quats.shape[1] == 4, quats.shape
+    q = quats.astype(np.float64)
+    q /= np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8, None)
+    M = (q[:, :, None] * q[:, None, :]).mean(axis=0)  # (4, 4)
+    eigvals, eigvecs = np.linalg.eigh(M)              # ascending order
+    mean_q = eigvecs[:, -1]                           # largest eigenvalue
+    mean_q = mean_q / np.clip(np.linalg.norm(mean_q), 1e-8, None)
+    # Canonicalise sign so w >= 0 (purely cosmetic; q and -q are equivalent).
+    if mean_q[0] < 0.0:
+        mean_q = -mean_q
+    return mean_q.astype(np.float32)
 
-    fwd = _safe_normalize(neck - back)                    # +x body axis
-    lat = _safe_normalize(rhip - lhip)                    # points left (+y)
-    z_axis = _safe_normalize(np.cross(fwd, lat))          # up (+z, right-handed)
-    y_axis = _safe_normalize(np.cross(z_axis, fwd))       # re-orthogonalised left
 
-    R = np.stack([fwd, y_axis, z_axis], axis=-1)
-    q = _rotmat_to_quat_batch(R)
-    return ensure_quaternion_continuity(q)
+def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    """Constant root orientation from the regularized thigh configuration.
+
+    Straight-walk prior: the dog's heading is constant, so we discard
+    per-frame rotation estimates and instead extract a single heading from
+    the time-averaged thigh geometry.
+
+    For each thigh i in {FL, FR, BL, BR} we compute its mean world-frame
+    offset from the root:
+
+        d_bar_i = (1/T) * sum_t (p_thigh_i(t) - p_root(t))   in R^3.
+
+    Because the clip is a straight walk with (by assumption) constant
+    heading, these mean offsets span the canonical body-frame hip rectangle
+    rotated by the unknown heading R. Forward and lateral axes follow from
+    the rectangle:
+
+        f_hat = normalize( mean(d_FL, d_FR) - mean(d_BL, d_BR) )   # +x body
+        l_hat = normalize( mean(d_FL, d_BL) - mean(d_FR, d_BR) )   # +y body
+
+    We project (f_hat, l_hat) onto the horizontal plane before extracting
+    z_hat = f_hat x l_hat, enforcing the straight-walk assumption that the
+    heading is a pure yaw (no pitch/roll bias from thigh-swing noise).
+    The in-plane axes are then re-orthogonalised.
+
+    This is strictly better-conditioned than neck<->back-end: the four hip
+    joints form a roughly rigid rectangle, whereas the spine deforms during
+    locomotion and injects a heading bias.
+    """
+    root = estimate_root_pos(keypoints)  # (T, 3), already in IsaacLab z-up
+    thighs = np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1)  # (T, 4, 3)
+
+    # Time-averaged thigh offsets from root (FL, FR, BL, BR).
+    d_bar = (thighs - root[:, None, :]).mean(axis=0)  # (4, 3)
+    d_fl, d_fr, d_bl, d_br = d_bar[0], d_bar[1], d_bar[2], d_bar[3]
+
+    fwd = 0.5 * (d_fl + d_fr) - 0.5 * (d_bl + d_br)   # front - back
+    lat = 0.5 * (d_fl + d_bl) - 0.5 * (d_fr + d_br)   # left  - right
+
+    # Straight-walk prior: heading is a pure yaw. Kill any z component in
+    # the in-plane axes before building the frame so noise in thigh height
+    # cannot tilt the body (no pitch/roll bias).
+    fwd[2] = 0.0
+    lat[2] = 0.0
+    fwd = fwd / np.clip(np.linalg.norm(fwd), 1e-8, None)
+    lat = lat / np.clip(np.linalg.norm(lat), 1e-8, None)
+
+    z_axis = np.cross(fwd, lat)
+    z_axis = z_axis / np.clip(np.linalg.norm(z_axis), 1e-8, None)   # +z world
+    y_axis = np.cross(z_axis, fwd)                                   # re-orthog. left
+    y_axis = y_axis / np.clip(np.linalg.norm(y_axis), 1e-8, None)
+
+    R_single = np.stack([fwd, y_axis, z_axis], axis=-1)[None, :, :]  # (1, 3, 3)
+    q_single = _rotmat_to_quat_batch(R_single)[0]                    # (4,)
+    if q_single[0] < 0.0:
+        q_single = -q_single                                          # canonical sign
+
+    T = root.shape[0]
+    return np.broadcast_to(q_single[None, :], (T, 4)).copy().astype(np.float32)
 
 
 def extract_foot_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
     return np.stack([xyz(keypoints[n]) for n in FOOT_NAMES], axis=1).astype(np.float32)
 
+def extract_thigh_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    return np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1).astype(np.float32)
 
-def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float = 0.5) -> None:
+
+def _quat_apply_batch(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vectors v by unit quaternions q (wxyz) using the closed-form
+
+        v' = v + 2 * w * (u x v) + 2 * (u x (u x v)),
+
+    where q = (w, u) and u in R^3. Vectorised over any leading batch shape as
+    long as q and v broadcast together on their leading dims.
+
+    Args:
+        q: (..., 4) unit quaternions, (w, x, y, z).
+        v: (..., 3) vectors.
+
+    Returns:
+        (..., 3) rotated vectors.
+    """
+    q = q / np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8, None)
+    w = q[..., 0:1]
+    u = q[..., 1:4]
+    # uxv and ux(uxv) via numpy cross with broadcasting
+    uxv = np.cross(u, v)
+    uxuxv = np.cross(u, uxv)
+    return (v + 2.0 * w * uxv + 2.0 * uxuxv).astype(np.float32)
+
+
+def _world_to_body(pts_world: np.ndarray, root_pos: np.ndarray, root_rot: np.ndarray) -> np.ndarray:
+    """World-frame points -> body-frame points.
+
+    Args:
+        pts_world: (T, K, 3) world-frame points (K keypoints per frame).
+        root_pos:  (T, 3) root positions in world.
+        root_rot:  (T, 4) root orientations (wxyz, world<-body).
+
+    Returns:
+        (T, K, 3) body-frame points.
+    """
+    rel = pts_world - root_pos[:, None, :]                       # (T, K, 3)
+    q_inv = root_rot.copy()
+    q_inv[..., 1:] *= -1.0                                       # conjugate
+    q_inv_b = np.broadcast_to(q_inv[:, None, :], rel.shape[:2] + (4,))
+    return _quat_apply_batch(q_inv_b, rel)
+
+
+def _body_to_world(pts_body: np.ndarray, root_pos: np.ndarray, root_rot: np.ndarray) -> np.ndarray:
+    """Body-frame points -> world-frame points (inverse of `_world_to_body`)."""
+    q_b = np.broadcast_to(root_rot[:, None, :], pts_body.shape[:2] + (4,))
+    rotated = _quat_apply_batch(q_b, pts_body)
+    return rotated + root_pos[:, None, :]
+
+
+def regularize_hips_to_anchor(
+    keypoints: dict[str, np.ndarray],
+    root_pos: np.ndarray,
+    root_rot: np.ndarray,
+    lambda_reg: float,
+) -> dict[str, np.ndarray]:
+    """L2-regularise hip (thigh) keypoints toward their per-hip body-frame mean.
+
+    Motivation
+    ----------
+    On the ANYmal-D, the four hip joints (leg roots) are rigidly attached to
+    the base: their positions in the body frame are *constants*. Raw mocap of
+    the dog's thighs, however, drifts frame-to-frame due to sensor noise and
+    soft-tissue artefacts, sometimes to the point of a left hip appearing on
+    the right side of the body. Because the thighs act as leg anchors for
+    downstream retargeting (scale factors, IK geometry), this contaminates
+    every later stage.
+
+    Formulation
+    -----------
+    Let p_i(t) in R^3 be the body-frame position of hip i at frame t, obtained
+    by transforming the raw world-frame thigh keypoint into the (nearly
+    constant) root frame. Let p_bar_i = (1/T) sum_t p_i(t) be the fixed
+    anchor for hip i. We solve, independently per (i, t),
+
+        p_tilde_i(t) = argmin_q  || q - p_i(t) ||^2 + lambda * || q - p_bar_i ||^2,
+
+    which admits the closed-form ridge solution
+
+        p_tilde_i(t) = ( p_i(t) + lambda * p_bar_i ) / (1 + lambda).
+
+    Limits:
+      lambda = 0       -> no correction (original mocap preserved).
+      lambda -> inf    -> hips fully pinned to the per-hip mean (rigid).
+      lambda ~ O(1-10) -> progressive shrinkage toward the anchor, eliminating
+                          pathological cross-body drift while preserving
+                          small, physical fluctuations.
+
+    The correction is applied in the **body frame** (where "fixed on the
+    robot" is the meaningful notion of fixed), then rotated back into world
+    coordinates before being written to `keypoints` so that downstream stages
+    (`estimate_root_pos` re-estimation notwithstanding, `extract_thigh_positions`,
+    `compute_scale_factors`, `retarget.py`) see a mocap-compatible signal.
+
+    Note that the **foot** keypoints are deliberately left untouched: only the
+    leg roots are being corrected. Foot motion fidelity is the point of the
+    retarget; hip motion is nuisance noise.
+
+    Args:
+        keypoints:  Dict mapping keypoint name -> (T, 4) array in the
+                    [x, y, likelihood, z] column layout used by this pipeline.
+                    Modified in place for the four thigh entries.
+        root_pos:   (T, 3) body-origin trajectory in world coordinates.
+        root_rot:   (T, 4) body orientation (wxyz) at each frame. May be
+                    per-frame or broadcast-constant; both are handled.
+        lambda_reg: Non-negative regularisation strength. If <= 0, the input
+                    is returned unchanged.
+
+    Returns:
+        The same `keypoints` dict with regularised thighs written back.
+    """
+    if lambda_reg <= 0.0:
+        print("[HipReg] lambda <= 0, skipping hip regularisation.")
+        return keypoints
+
+    # (T, 4_hips, 3) world-frame thighs in pipeline order
+    # [FL, FR, BL, BR], matching THIGH_NAMES.
+    thighs_world = np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1).astype(np.float32)
+
+    # Body-frame thighs.
+    thighs_body = _world_to_body(thighs_world, root_pos.astype(np.float32),
+                                 root_rot.astype(np.float32))                # (T, 4, 3)
+
+    # Per-hip anchor: mean over time in body frame.
+    anchors = thighs_body.mean(axis=0, keepdims=True)                        # (1, 4, 3)
+
+    # Closed-form ridge shrinkage toward the anchor.
+    thighs_body_reg = (thighs_body + lambda_reg * anchors) / (1.0 + lambda_reg)
+
+    # Diagnostics: how much did each hip move on average?
+    pre_dev = np.linalg.norm(thighs_body - anchors, axis=-1).mean(axis=0)    # (4,)
+    post_dev = np.linalg.norm(thighs_body_reg - anchors, axis=-1).mean(axis=0)
+    print(
+        f"[HipReg] lambda={lambda_reg:.2f} | mean |p - p_bar| per hip (pre -> post) [m]: "
+        + ", ".join(
+            f"{name}: {pre:.4f}->{post:.4f}"
+            for name, pre, post in zip(THIGH_NAMES, pre_dev, post_dev)
+        )
+    )
+
+    # Push back to world.
+    thighs_world_reg = _body_to_world(thighs_body_reg, root_pos.astype(np.float32),
+                                      root_rot.astype(np.float32))           # (T, 4, 3)
+
+    # Write corrected x, y, z back into `keypoints`, preserving likelihood col.
+    for hip_i, name in enumerate(THIGH_NAMES):
+        kp = keypoints[name]                                                 # (T, 4) [x,y,lh,z]
+        kp[:, 0] = thighs_world_reg[:, hip_i, 0]
+        kp[:, 1] = thighs_world_reg[:, hip_i, 1]
+        kp[:, 3] = thighs_world_reg[:, hip_i, 2]
+        keypoints[name] = kp
+
+    return keypoints
+
+
+def csv_to_npz(
+    csv_path: str,
+    output_path: str,
+    fps: float,
+    lh_threshold: float = 0.5,
+    hip_lambda: float = 5.0,
+) -> None:
+    """Convert mocap CSV to retarget-ready npz.
+
+    Args:
+        csv_path:    Input DeepLabCut / mocap CSV.
+        output_path: Destination .npz.
+        fps:         Source frame rate (Hz).
+        lh_threshold: Likelihood threshold below which frames are interpolated.
+        hip_lambda:  L2 regularisation strength pulling each hip (thigh)
+                     keypoint toward its body-frame temporal mean. Pass 0.0 to
+                     disable. On the ANYmal-D, hips are rigidly mounted on the
+                     base and *cannot* translate; this regulariser forces the
+                     mocap hips to honour that constraint without discarding
+                     their (small) per-frame variation entirely.
+    """
     dt = 1.0 / fps
     keypoints = parse_mocap_csv(csv_path)
     keypoints = smooth_low_confidence(keypoints, threshold=lh_threshold)
     keypoints = temporal_smooth_keypoints(keypoints, window=7)
 
+    # --- First-pass root estimation (uses raw-but-smoothed thighs). --------
+    # The root frame is needed to define "body frame", in which the hip
+    # anchor is meaningful. We tolerate noisy thighs here because the root
+    # estimators average over 3-4 keypoints, which attenuates per-hip noise.
     root_pos = smooth_series(estimate_root_pos(keypoints), window=5)
     root_rot = estimate_root_rot(keypoints)
     root_rot = smooth_series(root_rot, window=5)
+
+    # --- Hip (thigh) L2 regularisation toward the body-frame per-hip mean.
+    keypoints = regularize_hips_to_anchor(
+        keypoints=keypoints,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        lambda_reg=hip_lambda,
+    )
+
+    # --- Second-pass root re-estimation from the corrected thighs. --------
+    # `estimate_root_pos` pegs root-z to the mean thigh height, and
+    # `estimate_root_rot` uses thigh x,y to build the body axes, so both
+    # benefit from the de-noised hips.
+    root_pos = smooth_series(estimate_root_pos(keypoints), window=5)
+    root_rot = estimate_root_rot(keypoints)
+    # root_rot is already (near-)constant across T; smoothing a constant is a
+    # no-op but we retain the call for pipeline symmetry.
+    root_rot = smooth_series(root_rot, window=5)
+
     foot_pos = smooth_series(extract_foot_positions(keypoints), window=5)
+    thigh_pos = smooth_series(extract_thigh_positions(keypoints), window=5)
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +537,7 @@ def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float 
         root_pos=root_pos.astype(np.float32),
         root_rot=root_rot.astype(np.float32),
         foot_pos=foot_pos.astype(np.float32),
+        thigh_pos=thigh_pos.astype(np.float32),
         fps=np.array([fps], dtype=np.float32),
         dt=np.array([dt], dtype=np.float32),
         up_axis=np.array(["z"]),  # IsaacLab convention marker
@@ -251,5 +551,15 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--fps", type=float, required=True)
     parser.add_argument("--lh-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--hip-lambda",
+        type=float,
+        default=5.0,
+        help=(
+            "L2 regularisation strength pulling each hip (thigh) keypoint "
+            "toward its body-frame temporal mean. 0 disables; ~5-10 enforces "
+            "near-rigid hip anchors as on the ANYmal-D."
+        ),
+    )
     args = parser.parse_args()
-    csv_to_npz(args.csv, args.output, args.fps, args.lh_threshold)
+    csv_to_npz(args.csv, args.output, args.fps, args.lh_threshold, hip_lambda=args.hip_lambda)
