@@ -184,6 +184,7 @@ def compute_scale_factors(ref_motion: ReferenceMotion, meta: dict) -> dict:
 
     lat_animal = np.mean(np.abs(foot_local[:, 0, 1] - foot_local[:, 1, 1]))
     lon_animal = np.mean(np.abs(foot_local[:, 0, 0] - foot_local[:, 2, 0]))
+
     mean_foot_h = ref_motion.foot_pos[:, :, 2].mean(axis=1)
     base_h_animal = float(np.median(ref_motion.root_pos[:, 2] - mean_foot_h))
 
@@ -266,17 +267,25 @@ class QuadrupedRetargeter:
             joint_id = all_joint_names.index(joint_name)
             self.default_qpos[:, joint_id] = float(value)
 
-    def _flush_state(self, joint_pos: torch.Tensor, joint_vel: torch.Tensor | None = None) -> None:
-        # Write data to the sim from tensor buffer
+        # Fixed base pose for "pinned in the air" retargeting.
+        # Robot root is locked at (0, 0, 0.5) world with identity orientation (wxyz).
+        self.fixed_root_pos = torch.tensor(
+            [[0.0, 0.0, 0.5]], dtype=torch.float32, device=device
+        ).expand(num_envs, -1).contiguous()
+        self.fixed_root_rot = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=device
+        ).expand(num_envs, -1).contiguous()
+
+    def _flush_state(self, joint_pos, joint_vel=None):
         if joint_vel is None:
             joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel)
-       
-        # Run one timestep and update physics engine
         self.scene.write_data_to_sim()
-        self.sim.step()
+        self.sim.step(render=False)        # physics-only during inner IK
         self.scene.update(self.physics_dt)
         self.robot.update(self.physics_dt)
+
+        self.sim.render()
 
     def _teleport_base(self, root_pos_t: torch.Tensor, root_rot_t: torch.Tensor) -> None:
         root_state = self.robot.data.default_root_state.clone()
@@ -290,18 +299,18 @@ class QuadrupedRetargeter:
         dev = self.device
         E = self.num_envs
 
-        # rp: root_pos
-        # rr: root_rot
-        # expand all the positions to the number of environments
-        # note that rp, rr are both in world coordinates otherwise they would just be 0
-        rp = torch.tensor(root_pos, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
-        rr = torch.tensor(root_rot, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
+        # Base is pinned: ignore the per-frame reference root and use the fixed pose.
+        # `foot_pos_local` is already expressed in the *reference* root frame
+        # (from the original root_pos/root_rot), which is exactly what we want
+        # to feed the IK as base-frame targets for the pinned robot.
+        rp = self.fixed_root_pos
+        rr = self.fixed_root_rot
+
         foot_local = torch.tensor(foot_pos_local, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1, -1)
 
-        # Teleports the roots into the simulation 
+        # Hard-pin the base every frame so physics / Jacobians see the fixed pose.
         self._teleport_base(rp, rr)
 
-        # flush the state by writing the data to sim and running one timestep update
         jpos = self.default_qpos.clone()
         jvel = torch.zeros_like(jpos)
         self._flush_state(jpos, jvel)
@@ -320,6 +329,8 @@ class QuadrupedRetargeter:
                 ee_quat_w = self.robot.data.body_quat_w[:, foot_id, :]
                 ee_pos_b, ee_quat_b = subtract_frame_transforms(rp, rr, ee_pos_w, ee_quat_w)
 
+                # print(f"[INFO] Leg: {self.meta['joint_names'][leg_i]}, {foot_local[:, leg_i, :]}")
+            
                 target_pos_b = foot_local[:, leg_i, :]
                 ctrl.set_command(target_pos_b, ee_quat=ee_quat_b)
 
@@ -333,9 +344,12 @@ class QuadrupedRetargeter:
                 hi = self.robot.data.soft_joint_pos_limits[:, leg_ids, 1]
                 jpos[:, leg_ids] = torch.clamp(jpos[:, leg_ids], lo, hi)
 
+            self._teleport_base(rp, rr)
             self._flush_state(jpos, jvel)
 
         self.robot.update(self.physics_dt)
+
+        print(f"[INFO] Finished Solving Frame")
         
         return (
             jpos[0].detach().cpu().numpy().astype(np.float32),

@@ -2,6 +2,9 @@ import argparse
 import time
 from pathlib import Path
 
+import matplotlib
+import matplotlib.pyplot as plt  # noqa: E402
+
 import numpy as np
 import torch
 
@@ -23,6 +26,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--height_offset", type=float, default=0.0)
     p.add_argument("--ik_iterations", type=int, default=20)
     p.add_argument("--visualise", action="store_true", default=False)
+    p.add_argument("--plot_skeleton", action="store_true", default=False)
     return p
 
 
@@ -41,7 +45,7 @@ from isaaclab.assets import AssetBaseCfg, Articulation, ArticulationCfg  # noqa:
 from isaaclab.markers import VisualizationMarkers  # noqa: E402
 from isaaclab.markers.config import FRAME_MARKER_CFG  # noqa: E402
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg  # noqa: E402
-from isaaclab.utils import configclass  # noqa: E402
+from isaaclab.utils import configclass  # noqa: E402f
 
 from helpers import (  # noqa: E402
     ROBOT_META,
@@ -53,6 +57,93 @@ from helpers import (  # noqa: E402
     local_to_world_points,
     world_to_local_points,
 )
+
+class LiveSkeletonPlotter:
+    """Live 3D skeleton plot in the robot's body frame (normalized coords).
+
+    Root sits at the origin; feet are drawn at their body-frame positions.
+    Axis limits are fixed from the full precomputed trajectory so the view
+    doesn't jitter during playback.
+    """
+
+    FOOT_EDGES = [0, 1, 2, 3]  # root -> each of the four feet
+
+    def __init__(self, foot_pos_local_all: np.ndarray, foot_names: list[str], title: str = "Retarget skeleton (body frame)"):
+        plt.ion()
+        self._fig = plt.figure(figsize=(7, 7))
+        self._ax = self._fig.add_subplot(111, projection="3d")
+        self._ax.view_init(elev=20.0, azim=-100.0)
+        self._title = title
+        self._foot_names = foot_names
+
+        # Precompute fixed axis bounds from the whole trajectory.
+        # Include the origin (root) so the frame is always visible.
+        all_pts = np.concatenate(
+            [np.zeros((1, 3), dtype=np.float32), foot_pos_local_all.reshape(-1, 3)],
+            axis=0,
+        )
+        finite = np.isfinite(all_pts).all(axis=1)
+        pts = all_pts[finite]
+        mins, maxs = pts.min(axis=0), pts.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        half = 0.5 * float(np.max(maxs - mins))
+        half = max(half, 1e-3) * 1.1  # 10% padding
+        self._bounds = {
+            "x": (float(center[0] - half), float(center[0] + half)),
+            "y": (float(center[1] - half), float(center[1] + half)),
+            "z": (float(center[2] - half), float(center[2] + half)),
+        }
+
+    def update(self, root_world_t: np.ndarray, foot_local_t: np.ndarray, frame_idx: int, t_sec: float) -> None:
+        """Redraw one frame. foot_local_t has shape (4, 3) in body frame."""
+        ax = self._ax
+        ax.clear()
+
+        if root_world_t is None:
+            root = np.zeros(3, dtype=np.float32)
+        else: 
+            root = root_world_t 
+
+        # Scatter root and feet
+        ax.scatter(root[0], root[1], root[2], s=90, label="root")
+        ax.scatter(foot_local_t[:, 0], foot_local_t[:, 1], foot_local_t[:, 2], s=50, label="feet")
+
+        # Edges from root to each foot
+        for foot_i in self.FOOT_EDGES:
+            fp = foot_local_t[foot_i]
+            ax.plot([root[0], fp[0]], [root[1], fp[1]], [root[2], fp[2]], linewidth=2)
+
+        # Labels
+        for i, name in enumerate(self._foot_names):
+            ax.text(foot_local_t[i, 0], foot_local_t[i, 1], foot_local_t[i, 2], name, fontsize=7)
+
+        # Fixed formatting
+        ax.set_xlabel("x (body)")
+        ax.set_ylabel("y (body)")
+        ax.set_zlabel("z (body)")
+        ax.set_xlim(self._bounds["x"])
+        ax.set_ylim(self._bounds["y"])
+        ax.set_zlim(self._bounds["z"])
+        xr = self._bounds["x"][1] - self._bounds["x"][0]
+        yr = self._bounds["y"][1] - self._bounds["y"][0]
+        zr = self._bounds["z"][1] - self._bounds["z"][0]
+        try:
+            ax.set_box_aspect((xr, yr, zr))
+        except Exception:
+            pass
+
+        ax.set_title(f"{self._title} | frame={frame_idx} | t={t_sec:.2f}s")
+
+        # Non-blocking redraw
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+
+    def close(self) -> None:
+        plt.ioff()
+        try:
+            plt.close(self._fig)
+        except Exception:
+            pass
 
 
 @configclass
@@ -81,29 +172,41 @@ def smooth_signal(x: np.ndarray, window: int = 7) -> np.ndarray:
         out[(slice(None),) + idx] = np.convolve(xpad[(slice(None),) + idx], kernel, mode="valid")
     return out.astype(np.float32)
 
+def build_scaled_targets(root_pos: np.ndarray,
+                         root_rot: np.ndarray,
+                         foot_pos: np.ndarray,
+                         meta: dict,
+                         scale: dict,
+                         height_offset: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (scaled_root_pos, root_rot, scaled_foot_pos_world, foot_local_scaled).
 
-def build_scaled_targets(ref, meta: dict, scale: dict, height_offset: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    root_rot = ensure_quaternion_continuity(ref.root_rot)
+    `foot_local_scaled` is expressed in the *original* reference root frame
+    (from the un-modified root_pos / root_rot) so that feet motion stays
+    relative to the dog's body even when the robot base is pinned.
+    """
+    root_rot = ensure_quaternion_continuity(root_rot)
 
-    foot_local_ref = world_to_local_points(ref.root_pos, root_rot, ref.foot_pos)
+    # Feet relative to the ORIGINAL reference root frame.
+    foot_local_ref = world_to_local_points(root_pos, root_rot, foot_pos)
 
-    print(scale["x"], scale["y"], scale["z"])
-
-    # already smoothed
     foot_local_scaled = foot_local_ref.copy()
     foot_local_scaled[..., 0] *= scale["x"]
     foot_local_scaled[..., 1] *= scale["y"]
     foot_local_scaled[..., 2] *= scale["z"]
-    foot_local_scaled[..., 2] = np.clip(foot_local_scaled[..., 2], -meta["leg_length"] * 1.05, -0.02)
+    # foot_local_scaled[..., 2] = np.clip(foot_local_scaled[..., 2], -meta["leg_length"] * 1.05, -0.02)
 
-    scaled_root_pos = np.zeros_like(ref.root_pos, dtype=np.float32)
-    scaled_root_pos[:, :2] = ref.root_pos[:, :2]
-    scaled_root_pos[:, 2] = meta["base_height"] + float(height_offset)
+    # Kept for visualization / logging: world-frame feet under the (original)
+    # reference root, lifted by the robot's base height + offset.
+    scaled_root_pos = root_pos.astype(np.float32).copy()
 
     scaled_foot_pos_world = local_to_world_points(scaled_root_pos, root_rot, foot_local_scaled)
 
-    return scaled_root_pos.astype(np.float32), root_rot.astype(np.float32), scaled_foot_pos_world.astype(np.float32)
-
+    return (
+        scaled_root_pos.astype(np.float32),
+        root_rot.astype(np.float32),
+        scaled_foot_pos_world.astype(np.float32),
+        foot_local_scaled.astype(np.float32),
+    )
 
 def compute_kinematics_from_positions(joint_pos: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
     joint_pos_s = smooth_signal(joint_pos, window=7)
@@ -129,8 +232,13 @@ def run_targeting(args) -> None:
     ref = load_reference_motion(args.ref_motion, args.fps)
     meta = ROBOT_META[args.robot]
     scale = compute_scale_factors(ref, meta)
-    scaled_root_pos, scaled_root_rot, scaled_foot_pos_world = build_scaled_targets(ref, meta, scale, args.height_offset)
-    scaled_foot_pos_local = world_to_local_points(scaled_root_pos, scaled_root_rot, scaled_foot_pos_world)
+    
+    scaled_root_pos, scaled_root_rot, scaled_foot_pos_world, scaled_foot_pos_local = build_scaled_targets(
+        ref.root_pos, ref.root_rot, ref.foot_pos, meta, scale, args.height_offset
+    )
+    # NOTE: scaled_foot_pos_local is in the ORIGINAL reference root frame,
+    # so the feet move relative to the (pinned) robot body exactly as they
+    # moved relative to the dog's body.
 
     sim_cfg = sim_utils.SimulationCfg(
         dt=args.physics_dt,
@@ -140,6 +248,7 @@ def run_targeting(args) -> None:
     sim = sim_utils.SimulationContext(sim_cfg)
     if args.visualise:
         sim.set_camera_view(eye=[2.5, 2.0, 1.6], target=[0.0, 0.0, 0.45])
+        matplotlib.use("TkAgg")
 
     robot_cfg = get_robot_cfg(args.robot)
     scene_cfg = RetargetSceneCfg(num_envs=num_envs, env_spacing=2.0)
@@ -154,6 +263,7 @@ def run_targeting(args) -> None:
     robot.update(args.physics_dt)
 
     if args.visualise:
+        print(f"[INFO] Set up foot markers for visualization")
         frame_marker_cfg = FRAME_MARKER_CFG.copy()
         foot_marker_cfg = frame_marker_cfg.replace(prim_path="/Visuals/foot_targets")
         foot_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
@@ -162,50 +272,75 @@ def run_targeting(args) -> None:
         foot_markers = None
 
     retargeter = QuadrupedRetargeter(
-        robot=robot,
-        scene=scene,
-        sim=sim,
-        meta=meta,
-        device=device,
-        ik_iterations=args.ik_iterations,
-        ik_damping=args.ik_damping,
-        physics_dt=args.physics_dt,
-        num_envs=num_envs,
+        robot=robot, scene=scene, sim=sim, meta=meta, device=device,
+        ik_iterations=args.ik_iterations, ik_damping=args.ik_damping,
+        physics_dt=args.physics_dt, num_envs=num_envs,
     )
 
-    # get the total timesteps from inferring the horizontal length of the arr
     T = ref.root_pos.shape[0]
     isaac_joint_names = list(robot.joint_names)
     isaac_default = retargeter.default_qpos[0].detach().cpu().numpy().astype(np.float32)
 
-    out_root_pos = scaled_root_pos.astype(np.float32)
-    out_root_rot = scaled_root_rot.astype(np.float32)
+    # Export the FIXED base pose, broadcast across all T frames, so downstream
+    # consumers see a consistent "pinned in air" trajectory matching simulation.
+    out_root_pos = np.tile(
+        np.array([[0.0, 0.0, 0.5]], dtype=np.float32), (T, 1)
+    )
+    out_root_rot = np.tile(
+        np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (T, 1)
+    )
     
     out_joint_pos = np.zeros((T, len(isaac_joint_names)), dtype=np.float32)
     out_foot_pos = np.zeros((T, 4, 3), dtype=np.float32)
 
+    skeleton_plotter = None
+    if args.plot_skeleton:
+        skeleton_plotter = LiveSkeletonPlotter(
+            foot_pos_local_all=scaled_foot_pos_local,
+            foot_names=meta["foot_bodies"],
+        )
+
+    
     print(f"[Retarget] Processing {T} frames on {device}...")
     start = time.time()
-    for t in range(T):
-        jpos, _ = retargeter.solve_frame(
-            root_pos=out_root_pos[t],
-            root_rot=out_root_rot[t],
-            foot_pos_local=scaled_foot_pos_local[t],
-        )
-        out_joint_pos[t] = jpos
-        robot.update(args.physics_dt)
-        for leg_i, foot_id in enumerate(retargeter.foot_body_ids):
-            out_foot_pos[t, leg_i] = robot.data.body_pos_w[0, foot_id].detach().cpu().numpy()
+    try:
+        for t in range(T):
+            jpos, _ = retargeter.solve_frame(
+                root_pos=out_root_pos[t],
+                root_rot=out_root_rot[t],
+                foot_pos_local=scaled_foot_pos_local[t],
+            )
+            print(f"{out_root_pos[t]}")
+            out_joint_pos[t] = jpos
+            robot.update(args.physics_dt)
+            for leg_i, foot_id in enumerate(retargeter.foot_body_ids):
+                out_foot_pos[t, leg_i] = robot.data.body_pos_w[0, foot_id].detach().cpu().numpy()
 
-        if foot_markers is not None:
-            print(f"[Retarget] Visualizing foot markers")
-            foot_markers.visualize(translations=torch.tensor(scaled_foot_pos_world[t], device=device, dtype=torch.float32))
-            sim.render()
+            if foot_markers is not None:
+                # Targets in world frame under the pinned base: translate by
+                # fixed_root_pos and rotate by identity -> just add the offset.
+                world_targets = scaled_foot_pos_local[t] + np.array([0.0, 0.0, 0.5], dtype=np.float32)
+                foot_markers.visualize(
+                    translations=torch.tensor(world_targets, device=device, dtype=torch.float32)
+                )
+                sim.render()
 
-        if (t + 1) % 25 == 0 or t == T - 1:
-            elapsed = max(time.time() - start, 1e-6)
-            rate = (t + 1) / elapsed
-            print(f"  frame {t + 1:5d}/{T} | {rate:.1f} frames/s")
+            if skeleton_plotter is not None:
+                skeleton_plotter.update(
+                    root_world_t=out_root_pos[t],
+                    foot_local_t=scaled_foot_pos_local[t],
+                    frame_idx=t,
+                    t_sec=t * ref.dt,
+                )
+
+            if (t + 1) % 25 == 0 or t == T - 1:
+                elapsed = max(time.time() - start, 1e-6)
+                rate = (t + 1) / elapsed
+                print(f"  frame {t + 1:5d}/{T} | {rate:.1f} frames/s")
+    finally:
+        if skeleton_plotter is not None:
+            skeleton_plotter.close()
+
 
     out_joint_vel, out_joint_acc = compute_kinematics_from_positions(out_joint_pos, ref.dt)
     joint_pos_for_training = to_training_joint_format(out_joint_pos, isaac_default)

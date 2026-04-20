@@ -1,5 +1,23 @@
 """
 preprocess_csv_fixed.py — Convert animal motion-capture CSV to retargeting-ready .npz
+
+Coordinate convention
+---------------------
+The source mocap CSV is assumed to be in a y-up right-handed frame (x, y, z)_src.
+IsaacLab uses a z-up right-handed frame (x, y, z)_iso. We convert between them
+with a proper rotation of +90° about the x-axis:
+
+                       | 1  0   0 |
+    R_x(+90°)  =       | 0  0  -1 |
+                       | 0  1   0 |
+
+    (x, y, z)_iso = (x_src, -z_src, y_src)      # forward-x preserved, up-y -> up-z
+
+This is a determinant-+1 rotation (handedness preserved), unlike a naive
+(x, y, z) -> (x, z, y) swap which would invert chirality and silently corrupt
+downstream rotations. The transform is applied once, immediately after CSV
+parsing, so every subsequent operation (smoothing, root-frame estimation, foot
+extraction) runs in IsaacLab coordinates and requires no further changes.
 """
 
 from __future__ import annotations
@@ -20,6 +38,24 @@ FOOT_NAMES = [
 TRUNK_NAMES = ["neck_base", "back_middle", "back_end"]
 
 
+def _mocap_to_isaac(xyz_src: np.ndarray) -> np.ndarray:
+    """Rotate y-up mocap coordinates into IsaacLab's z-up frame.
+
+    Applies R_x(+90°):  (x, y, z) -> (x, -z, y)
+
+    Args:
+        xyz_src: Array with shape (..., 3) holding source (x, y, z) positions.
+
+    Returns:
+        Array of the same shape in IsaacLab coordinates.
+    """
+    out = np.empty_like(xyz_src)
+    out[..., 0] = xyz_src[..., 0]
+    out[..., 1] = xyz_src[..., 2]
+    out[..., 2] = -xyz_src[..., 1]
+    return out
+
+
 def parse_mocap_csv(csv_path: str) -> dict[str, np.ndarray]:
     with open(csv_path, "r") as f:
         lines = f.readlines()
@@ -35,23 +71,28 @@ def parse_mocap_csv(csv_path: str) -> dict[str, np.ndarray]:
 
     data_lines = lines[2:]
     raw = np.zeros((len(data_lines), len(header_parts)), dtype=np.float64)
-    
+
     for t, line in enumerate(data_lines):
         raw[t] = [float(v.strip()) for v in line.strip().split(",")]
 
     keypoints: dict[str, np.ndarray] = {}
     for part, fields in col_map.items():
+        # Gather source-frame (x, y, z) then rotate into IsaacLab (z-up) frame.
+        src_xyz = np.stack(
+            [raw[:, fields["x"]], raw[:, fields["y"]], raw[:, fields["z"]]],
+            axis=-1,
+        )
+        iso_xyz = _mocap_to_isaac(src_xyz)
+        likelihood = raw[:, fields["likelihood"]]
+
+        # Preserve the [x, y, likelihood, z] column layout expected by the rest
+        # of the pipeline (see xyz() helper below). Values are now z-up.
         keypoints[part] = np.stack(
-            [
-                raw[:, fields["x"]],
-                raw[:, fields["y"]],
-                raw[:, fields["likelihood"]],
-                raw[:, fields["z"]],
-            ],
+            [iso_xyz[:, 0], iso_xyz[:, 1], likelihood, iso_xyz[:, 2]],
             axis=-1,
         ).astype(np.float32)
 
-    print(f"[CSV] Parsed {raw.shape[0]} frames, {len(keypoints)} keypoints")
+    print(f"[CSV] Parsed {raw.shape[0]} frames, {len(keypoints)} keypoints (IsaacLab z-up)")
     return keypoints
 
 
@@ -155,15 +196,20 @@ def ensure_quaternion_continuity(quats: np.ndarray) -> np.ndarray:
 
 
 def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    """Build a body frame in IsaacLab convention: x-forward, y-left, z-up.
+
+    Because keypoints were rotated into z-up at parse time, the construction
+    below yields a proper z-up rotation matrix without any further changes.
+    """
     neck = xyz(keypoints["neck_base"])
     back = xyz(keypoints["back_end"])
     lhip = xyz(keypoints["front_left_thai"])
     rhip = xyz(keypoints["front_right_thai"])
 
-    fwd = _safe_normalize(neck - back)
-    lat = _safe_normalize(rhip - lhip)
-    z_axis = _safe_normalize(np.cross(fwd, lat))
-    y_axis = _safe_normalize(np.cross(z_axis, fwd))
+    fwd = _safe_normalize(neck - back)                    # +x body axis
+    lat = _safe_normalize(rhip - lhip)                    # points left (+y)
+    z_axis = _safe_normalize(np.cross(fwd, lat))          # up (+z, right-handed)
+    y_axis = _safe_normalize(np.cross(z_axis, fwd))       # re-orthogonalised left
 
     R = np.stack([fwd, y_axis, z_axis], axis=-1)
     q = _rotmat_to_quat_batch(R)
@@ -193,6 +239,7 @@ def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float 
         foot_pos=foot_pos.astype(np.float32),
         fps=np.array([fps], dtype=np.float32),
         dt=np.array([dt], dtype=np.float32),
+        up_axis=np.array(["z"]),  # IsaacLab convention marker
     )
     print(f"[Preprocess] Saved {root_pos.shape[0]} frames @ {fps} Hz -> '{out_path}'")
 
