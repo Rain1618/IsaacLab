@@ -222,22 +222,31 @@ def world_to_local_points(root_pos: np.ndarray,
                           root_rot: np.ndarray,
                           world_points: np.ndarray,
                           quat_order: str = "xyzw") -> np.ndarray:
-    """Transform world-frame points into the per-timestep body frame.
+    """Transform world-frame points into a root-translated (but NOT rotated)
+    frame.
 
-    x_local_t = R_t^T (x_world_t - p_t)
+        x_local_t = x_world_t - p_t
+
+    The local frame stays axis-aligned with the world across time. This
+    sacrifices body-frame semantics (scaling along "body forward" vs "world x")
+    in exchange for numerical stability: any per-frame noise in `root_rot`
+    would otherwise be amplified by the lever arm to each foot and then re-
+    amplified by the scale factors, producing visible jitter in the
+    retargeted motion.
+
+    `root_rot` and `quat_order` are kept in the signature for API symmetry
+    with `local_to_world_points` but are intentionally unused.
 
     Shapes:
         root_pos     : (T, 3)
-        root_rot     : (T, 4) quat or (T, 3) Euler
+        root_rot     : (T, 4) quat or (T, 3) Euler  [unused]
         world_points : (T, N, 3)
 
     Returns:
-        (T, N, 3) points in body frame.
+        (T, N, 3) points translated into the root-centered frame.
     """
-    R = root_rot_to_rotmat(root_rot, quat_order=quat_order)     # (T,3,3)
-    rel = world_points.astype(np.float64) - root_pos.astype(np.float64)[:, None, :]
-    # Batched R^T @ rel: einsum contracts index 'j' on R's first (transpose) dim.
-    local = np.einsum("tji,tnj->tni", R, rel)
+    del root_rot, quat_order  # unused in translation-only variant
+    local = world_points.astype(np.float64) - root_pos.astype(np.float64)[:, None, :]
     return local.astype(world_points.dtype)
 
 
@@ -245,10 +254,14 @@ def local_to_world_points(root_pos: np.ndarray,
                           root_rot: np.ndarray,
                           local_points: np.ndarray,
                           quat_order: str = "xyzw") -> np.ndarray:
-    """Inverse of world_to_local_points: x_world_t = R_t x_local_t + p_t."""
-    R = root_rot_to_rotmat(root_rot, quat_order=quat_order)     # (T,3,3)
-    rotated = np.einsum("tij,tnj->tni", R, local_points.astype(np.float64))
-    world = rotated + root_pos.astype(np.float64)[:, None, :]
+    """Inverse of `world_to_local_points` (translation-only):
+
+        x_world_t = x_local_t + p_t
+
+    `root_rot` and `quat_order` are accepted for API symmetry but unused.
+    """
+    del root_rot, quat_order  # unused in translation-only variant
+    world = local_points.astype(np.float64) + root_pos.astype(np.float64)[:, None, :]
     return world.astype(local_points.dtype)
 
 

@@ -228,6 +228,7 @@ def csv_to_npz(csv_path: str, output_path: str, fps: float, lh_threshold: float 
 
     root_pos = smooth_series(estimate_root_pos(keypoints), window=5)
     root_rot = estimate_root_rot(keypoints)
+    root_rot = smooth_series(root_rot, window=5)
     foot_pos = smooth_series(extract_foot_positions(keypoints), window=5)
 
     out_path = Path(output_path)
