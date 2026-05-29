@@ -1,3 +1,30 @@
+"""
+train_motion_imitation_ghost.py — BC → PPO motion imitation for Anymal-D
+
+Training pipeline
+-----------------
+Stage 1 (--mode bc):  Behavior Cloning from open-loop reference playback.
+
+Stage 2 (--mode rl):  PPO fine-tuning initialized from the BC checkpoint.
+    A KL penalty toward the frozen BC policy prevents catastrophic forgetting
+    while the velocity-tracking reward shapes the gait toward forward motion.
+    The BC init is the reason RL converges in ~1-2k iterations instead of
+    the tens of thousands typically needed from scratch.
+
+Ghost robot
+-----------
+A second "ghost_robot" rigid body (defined in AnymalDImitationFlatEnvCfg)
+floats above the real robot showing the reference pose side-by-side.
+This is purely for visual debugging — it has no effect on observations or
+rewards.  See update_shadow_robot() for the write logic.
+
+Coordinate convention
+---------------------
+Motion data arrives in PyBullet joint ordering and uses a different default
+pose than IsaacLab.  load_motion() handles both remapping (PYB_TO_ISAAC)
+and re-centering around ISAAC_DEFAULT so the action space stays near zero.
+"""
+
 import argparse
 from isaaclab.app import AppLauncher
 
@@ -61,6 +88,9 @@ parser.add_argument("--damping", type=float, default=5.0)
 
 args_cli = parser.parse_args()
 
+# AppLauncher MUST be constructed before any IsaacSim/IsaacLab imports.
+# The launcher starts the underlying Omniverse runtime, without which the
+# Python bindings for isaac* modules are not yet registered.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -85,7 +115,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Generate a unique 8-char hash based on the current timestamp
+# Unique run ID prevents successive runs from clobbering each other's checkpoints.
 run_hash = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
 run_type = args_cli.mode.upper()
 args_cli.save_dir = os.path.join(args_cli.save_dir, run_type + "_" + run_hash)
@@ -110,6 +140,7 @@ PHASE_DIM = 2  # sin + cos phase encoding
 
 
 def load_motion(npz_path: str) -> dict:
+    
     data = np.load(npz_path)
     frame_dt = float(data["frame_duration"])
     raw_pyb = np.asarray(data["joint_pos"], dtype=np.float32)
@@ -962,10 +993,12 @@ def main():
     n_envs = 1 if args_cli.mode == "eval" else args_cli.num_envs
     env = make_env(n_envs)
 
+    # Switch between BC and RL to reuse duplicate functionality
     if args_cli.mode == "bc":
         os.makedirs(args_cli.save_dir, exist_ok=True)
         policy = MLP(OBS_DIM, ACTION_DIM, stochastic=False,
                      use_phase=args_cli.bc_phase_obs)
+        
         obs_b, act_b, ph_b = collect_bc_data(env, clip, device)
         policy = train_bc(obs_b, act_b, ph_b, policy, device)
 

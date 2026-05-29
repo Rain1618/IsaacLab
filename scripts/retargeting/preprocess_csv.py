@@ -44,11 +44,18 @@ THIGH_NAMES = [
 
 TRUNK_NAMES = ["neck_base", "back_middle", "back_end"]
 
+"""
+In this script the term "mocap" is used to reference the keypoint animation.
+
+In the original version, the retargeting was performed on a mocap reference.
+This later generalized to DeepLabCut 2D footage extractions, which stopped making sense.
+The terminology was used too frequently to warrant a change.
+"""
 
 def _mocap_to_isaac(xyz_src: np.ndarray) -> np.ndarray:
     """Rotate y-up mocap coordinates into IsaacLab's z-up frame.
 
-    Applies R_x(+90°):  (x, y, z) -> (x, -z, y)
+    Applied 90 deg rot: (x, y, z) -> (x, -z, y)
 
     Args:
         xyz_src: Array with shape (..., 3) holding source (x, y, z) positions.
@@ -64,24 +71,51 @@ def _mocap_to_isaac(xyz_src: np.ndarray) -> np.ndarray:
 
 
 def parse_mocap_csv(csv_path: str) -> dict[str, np.ndarray]:
+    """Parse a two-row-header mocap CSV into a keypoint dictionary.
+
+    The CSV is expected to have a part name row followed by a field name row
+    (e.g. "x", "y", "z", "likelihood"), with one data row per frame thereafter.
+    Positions are transformed from the mocap capture frame into the IsaacLab
+    z-up coordinate frame via ``_mocap_to_isaac``.
+
+    Args:
+        csv_path: Path to the mocap CSV file.
+
+    Returns:
+        A dict mapping each body-part name to a float32 array of shape
+        ``(T, 4)`` with columns ``[x, y, likelihood, z]`` in IsaacLab frame,
+        where ``T`` is the number of frames.
+    """
     with open(csv_path, "r") as f:
         lines = f.readlines()
 
+    # Parse using primitive string parsing
+    # eg. header_parts:     front_left_paw
+    # eg. header_fields:    x
     header_parts = lines[0].strip().split(",")
     header_fields = lines[1].strip().split(",")
 
+    # Build a nested lookup: col_map[part][field] -> column index in `raw`.
+    # The two header rows are "wide" — each part name spans multiple columns
+    # (one per field: x, y, z, likelihood). Zipping them gives us the
+    # (part, field) pair for each column position, which we invert into a
+    # dict-of-dicts so downstream code can do col_map["front_left_paw"]["x"]
+    # instead of scanning the header arrays on every access.
     col_map: dict[str, dict[str, int]] = {}
     for col_i, (part, field) in enumerate(zip(header_parts, header_fields)):
         part = part.strip()
         field = field.strip()
         col_map.setdefault(part, {})[field] = col_i
+        
+    data_lines = lines[2:]      # strip the headers (fixed at 2 lines)
+    raw = np.zeros((len(data_lines), len(header_parts)), dtype=np.float64)  # create a large block of buffer
 
-    data_lines = lines[2:]
-    raw = np.zeros((len(data_lines), len(header_parts)), dtype=np.float64)
-
+    # For every line convert string to float and strip, adding it to the raw buffer
     for t, line in enumerate(data_lines):
         raw[t] = [float(v.strip()) for v in line.strip().split(",")]
 
+
+    # Construct the dictionary, then iterate through each frame
     keypoints: dict[str, np.ndarray] = {}
     for part, fields in col_map.items():
         # Gather source-frame (x, y, z) then rotate into IsaacLab (z-up) frame.
@@ -108,6 +142,8 @@ def xyz(kp: np.ndarray) -> np.ndarray:
 
 
 def smooth_series(x: np.ndarray, window: int = 7) -> np.ndarray:
+    """Smooths a time-series using a specified windows size. The operation is similar to
+    convoluting over a window-ed size kernel."""
     if window <= 1 or x.shape[0] < 3:
         return x.astype(np.float32)
     if window % 2 == 0:
@@ -158,7 +194,7 @@ def estimate_root_pos(keypoints: dict[str, np.ndarray]) -> np.ndarray:
     so the root tracks the hip plane rather than sitting on the spine.
     This keeps the root at a retargeting-friendly height (close to the
     robot's base link) while preserving the horizontal trajectory from
-    the trunk.
+    the trunk (more similar to morphology of Anymal-D).
     """
     trunk_xyz = np.stack([xyz(keypoints[n]) for n in TRUNK_NAMES], axis=1)
     root = trunk_xyz.mean(axis=1)                                   # (T, 3)
@@ -174,6 +210,7 @@ def _safe_normalize(v: np.ndarray) -> np.ndarray:
 
 
 def _rotmat_to_quat_batch(R: np.ndarray) -> np.ndarray:
+    """Converts a batch of rotation matrices into quaternions via numpy broadcasting"""
     B = R.shape[0]
     q = np.zeros((B, 4), dtype=np.float64)
     tr = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
@@ -212,6 +249,7 @@ def _rotmat_to_quat_batch(R: np.ndarray) -> np.ndarray:
 
 
 def ensure_quaternion_continuity(quats: np.ndarray) -> np.ndarray:
+    """Preservecs the continuity of the quaternions by inverting the coefficient values."""
     q = quats.copy().astype(np.float32)
     q /= np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8, None)
     for t in range(1, q.shape[0]):
@@ -225,7 +263,7 @@ def mean_quaternion(quats: np.ndarray) -> np.ndarray:
 
     Uses the eigenvalue method of Markley et al. (2007). Given unit
     quaternions q_1, ..., q_T (rows of `quats`), forms the 4x4 symmetric
-    accumulator
+    accumulator. This was referenced in the motion imitation paper.
 
         M = (1/T) * sum_t q_t q_t^T,
 
@@ -252,6 +290,8 @@ def mean_quaternion(quats: np.ndarray) -> np.ndarray:
         mean_q = -mean_q
     return mean_q.astype(np.float32)
 
+
+### NOTE: THIS IS NOT USED IN OUR EXPERIMENTS but CLAUDE rec'd using this
 
 # def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
 #     """Constant root orientation from the regularized thigh configuration.
@@ -390,9 +430,11 @@ def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def extract_foot_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    """Obtain the foot positions from the keypoints dictionary into a numpy array"""
     return np.stack([xyz(keypoints[n]) for n in FOOT_NAMES], axis=1).astype(np.float32)
 
 def extract_thigh_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
+    """Obtain the thigh positions from the keypoints dictionary into a numpy array"""
     return np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1).astype(np.float32)
 
 
@@ -557,7 +599,7 @@ def csv_to_npz(
     lh_threshold: float = 0.5,
     hip_lambda: float = 5.0,
 ) -> None:
-    """Convert mocap CSV to retarget-ready npz.
+    """Convert mocap CSV to retarget-ready npz  (Acts as the main function for this script).
 
     Args:
         csv_path:    Input DeepLabCut / mocap CSV.
@@ -571,7 +613,9 @@ def csv_to_npz(
                      mocap hips to honour that constraint without discarding
                      their (small) per-frame variation entirely.
     """
-    dt = 1.0 / fps
+    
+    dt = 1.0 / fps  # the dt becomes important for retargeting as Isaac as a diff rate than the clip
+    # Pipelines keypoints through three functions, you can optionally take some of them out
     keypoints = parse_mocap_csv(csv_path)
     keypoints = smooth_low_confidence(keypoints, threshold=lh_threshold)
     keypoints = temporal_smooth_keypoints(keypoints, window=7)
@@ -607,6 +651,8 @@ def csv_to_npz(
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save to output location via compressed format
+    # Adjust here if you need more for retarget.py
     np.savez_compressed(
         str(out_path),
         root_pos=root_pos.astype(np.float32),
@@ -637,4 +683,5 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    # Runs the main function
     csv_to_npz(args.csv, args.output, args.fps, args.lh_threshold, hip_lambda=args.hip_lambda)

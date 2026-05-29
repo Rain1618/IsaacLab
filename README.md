@@ -1,5 +1,9 @@
 ![Isaac Lab](docs/source/_static/isaaclab.jpg)
 
+> [!NOTE]
+> Please refer to the file [README_changes.md](./README_changes.md) for notes about the research project. 
+> The rest of this README is the default [IsaacLab](https://github.com/isaac-sim/IsaacLab) `README.md`.
+
 ---
 
 # Isaac Lab

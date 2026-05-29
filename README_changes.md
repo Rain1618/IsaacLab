@@ -1,6 +1,6 @@
 # Motion Imitation for ANYmal-D
 
-This document describes the research additions on top of the upstream [IsaacLab](https://github.com/isaac-sim/IsaacLab) fork. The goal is quadruped motion imitation: capture real animal movement from video, retarget it to an ANYmal-D robot, and train a policy that reproduces that motion in simulation using Behavioral Cloning (BC).
+This document describes the research additions on top of the upstream [IsaacLab](https://github.com/isaac-sim/IsaacLab) fork. The goal is quadruped motion imitation: capture real animal movement from video, retarget it to an ANYmal-D robot, and train a policy that reproduces that motion in simulation using Behavioral Cloning (BC). This repository covers retargeting and policy training. 
 
 ---
 
@@ -61,12 +61,12 @@ scripts/
 │       ├── policy_rl.pt
 │       └── bc_loss_curve.png
 ├── retargeting/
-│   ├── preprocess_csv.py                   # MoCap CSV → retarget-ready .npz
+│   ├── preprocess_csv.py                   # gets the csv -> retarget-ready .npz
 │   ├── retarget.py                         # IK-based retargeting in IsaacLab sim
-│   ├── helpers.py                          # math utilities + QuadrupedRetargeter
-│   ├── test_preprocess.py                  # unit tests for preprocessing
+│   ├── helpers.py                          #  utility classes for retarget.py
+│   ├── test_preprocess.py                  # unit tests for preprocess_csv.py
 │   ├── data/                               # sample MoCap CSVs and outputs
-│   └── viz/plot_3d_skeleton.py             # 3-D skeleton visualiser
+│   └── viz/plot_3d_skeleton.py             # 3-D skeleton visualiser (modified from `copydog` repository)
 └── reinforcement_learning/skrl/train.py    # skrl-based PPO trainer (upstream + minor edits)
 
 source/
@@ -129,6 +129,8 @@ python scripts/retargeting/retarget.py \
     [--visualise]          # opens a viewer to watch the IK solve
     [--plot_skeleton]      # shows a live 3-D skeleton plot
 ```
+
+Smoothing is performed in `preprocess_csv.py` to reduce the overhead from running and adjust `retarget.py`. `retarget.py` is the main script that performs the retargeting.
 
 The retargeter pins the robot base in the air and solves per-leg IK iteratively (damped least squares). It exports a `.npz` containing `joint_pos` (in training format), `frame_duration`, `root_pos`, `joint_vel`, and more.
 
