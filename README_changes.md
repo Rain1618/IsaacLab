@@ -6,8 +6,10 @@ This document describes the research additions on top of the upstream [IsaacLab]
 
 ## Overview of the Pipeline
 
+This repository concerns itself with **motion smoothing -> retargeting -> (optional viz) -> behavior cloning -> policy**. To obtain the motion you have to use the [copydog](https://github.com/Rain1618/copydog) repository instead. The rest of the `README.md` concerns itself with how you can run these commands and the necessary setup to get it working.
+
 ```
-Animal Video Keypoint CSV
+Animal Video Keypoint CSV                   ← Get it from [`copydog`](https://github.com/Rain1618/copydog)
         │
         ▼
 [1] scripts/retargeting/preprocess_csv.py   ← CSV → .npz (z-up, smoothed)
@@ -38,13 +40,19 @@ Animal Video Keypoint CSV
 
 ---
 
+## Obtaining Data
+
+Data was obtained from online footage of reference animal motions. The following is an example video of data that may potentially work.
+
+[![Watch the video](https://img.youtube.com/vi/2T47EAmBynw/maxresdefault.jpg)](https://www.youtube.com/watch?v=2T47EAmBynw)
+
 ## Directory Layout
 
 The default IssacLab repository files are generally ignored for readability.
 
 ```
 scripts/
-├── environments/
+├── environments/                       # behavior cloning
 │   ├── anymal_motion_playback.py           # simple open-loop playback of a motion clip
 │   ├── motion_to_isaac.py                  # standalone coordinate-conversion utility
 │   ├── graphing_joint_motion.py            # visualise joint trajectories
@@ -60,7 +68,7 @@ scripts/
 │       ├── policy_bc.pt
 │       ├── policy_rl.pt
 │       └── bc_loss_curve.png
-├── retargeting/
+├── retargeting/                        # motion retargeting
 │   ├── preprocess_csv.py                   # gets the csv -> retarget-ready .npz
 │   ├── retarget.py                         # IK-based retargeting in IsaacLab sim
 │   ├── helpers.py                          #  utility classes for retarget.py
@@ -87,6 +95,30 @@ source/
 
 Follow the standard IsaacLab installation. The motion imitation code additionally requires `scipy`:
 
+**Activate the Isaac Lab environment** before installing dependencies or running any scripts:
+
+```bash
+# Option 1: activate the conda environment directly (standard install)
+conda activate env_isaaclab
+
+# Option 2: source the shell helper (activates conda env and sets ISAACLAB_PATH)
+source ./isaaclab.sh --conda
+```
+
+To set `ISAACLAB_PATH` manually or embed it in the VSCode integrated terminal, add the following to `.vscode/settings.json`:
+
+```json
+{
+  "terminal.integrated.env.osx": {
+    "ISAACLAB_PATH": "/path/to/IsaacLab"
+  },
+  "terminal.integrated.defaultProfile.osx": "zsh",
+  "terminal.integrated.shellArgs.osx": ["-l", "-c", "conda activate isaaclab; exec zsh"]
+}
+```
+
+Then install the additional dependency:
+
 ```bash
 pip install scipy
 ```
@@ -102,6 +134,8 @@ pip install scipy
 
 **Option A: from an ANYmal-format JSON (e.g. from another research paper or library)**
 
+This option involves taking a mocap reference motion from other papers that do not utilize our methodology. You can do so using the following command:
+
 ```bash
 python scripts/environments/data/convert_txt_to_npz.py \
     --input  scripts/environments/data/pace.json \
@@ -111,6 +145,8 @@ python scripts/environments/data/convert_txt_to_npz.py \
 The JSON format is expected to have `"Frames"` (shape `[T, 19]`: root_pos(3), root_rpy(4), joint_pos(12)) and `"FrameDuration"`.
 
 **Option B: from a DeepLabCut / MoCap CSV of real animal video**
+
+This is the one of the main contributions of this project (retargeting using Isaac). Option B uses an IK controller to iteratively retarget the reference motion onto the morphology of the `Anymal-D`.
 
 ```bash
 # 1. Convert CSV to retarget-ready .npz (coordinate transform + smoothing)
@@ -162,6 +198,9 @@ python scripts/environments/anymal_motion_playback.py \
     --num_envs 1
 ```
 
+> [!WARNING]
+> This command currently suffers from permission issues after testing on `410` PC.
+
 ---
 
 ### Step 3 — Behavioral Cloning
@@ -200,7 +239,7 @@ Outputs:
 
 ### Step 4 — PPO Fine-Tuning
 
-Fine-tunes from the BC checkpoint using a stochastic MLP policy + value network, with a motion-tracking reward.
+Fine-tunes a policy from the BC checkpoint using a stochasticity + value network, with a motion-tracking reward.
 
 ```bash
 python scripts/environments/train_motion_imitation.py \
@@ -250,7 +289,9 @@ The script auto-detects whether the checkpoint is from BC (deterministic) or RL 
 
 ## Coordinate Conventions
 
-Two coordinate frames appear throughout this codebase:
+An important fact to note is the difference of coordinate conventions between Isaac the extracted reference motion data from `copydog`. 
+
+Overview of two coordinate frames appear throughout this codebase:
 
 | Frame | Up axis | Used by |
 |---|---|---|
@@ -263,9 +304,9 @@ Conversion: `(x, y, z)_iso = (x_src, -z_src, y_src)` — a proper rotation of +9
 
 ---
 
-## Environment Configurations
+## IsaacLab Environment Configurations
 
-Two new ManagerBasedRL environment configs are provided for the imitation task:
+For this project, we modified the manager-based training environments. Two new ManagerBasedRL environment configs are provided for the imitation task:
 
 **`ImitationRoughEnvCfg`** ([source/isaaclab_tasks/.../imitation_env_cfg.py](source/isaaclab_tasks/isaaclab_tasks/manager_based/locomotion/velocity/imitation_env_cfg.py))
 - Subclasses the standard rough-terrain locomotion env
@@ -318,10 +359,19 @@ Checkpoint format:
 
 ---
 
+## Glossary (README.md files)
+
+| Module | Description | Documentation |
+|--------|-------------|---------------|
+| `scripts/environments` | Depth estimation and 3D keypoint processing | [README](./scripts/environments/README.md) |
+| `scripts/environments/data` | Pipeline inputs and outputs (videos, keypoints, checkpoints) | [README](./scripts/environments/data/README.md) |
+
+---
+
 ## Known Limitations / Open TODOs
 
-- Root state initialisation during RL resets re-randomises joint phases but does not reset the base pose — only joint states are written to sim.
-- The ghost robot infrastructure in the env config is not yet wired up in the training loop (no motion-tracking visualisation during training). Use `train_motion_imitation_ghost.py` for ghost infra.
+- Root state initialization during RL resets re-randomizes joint phases but does not reset the base pose — only joint states are written to sim.
+- The ghost robot infrastructure in the env config is not yet wired up in the training loop (no motion-tracking visualization during training). Use `train_motion_imitation_ghost.py` for ghost infra.
 - The motion-tracking reward currently only uses joint position error. Joint velocity and forward velocity reward terms exist in code but have their weights set to 0. This is modified in the other versions of `train_motion_imitation`.
 - `preprocess_csv.py` assumes a straight-walk prior (constant heading) when estimating root orientation; it will not accurately handle turning sequences. **This one of the largest limitations we've been working on throughout April**. It seems like the DeepLabCut clip produces a skew bias on the heading angle due to occlusions. We require a methodology that infers this accurate before *behaviour cloning*.
 - `retarget.py` currently requires `--num_envs 1`.
