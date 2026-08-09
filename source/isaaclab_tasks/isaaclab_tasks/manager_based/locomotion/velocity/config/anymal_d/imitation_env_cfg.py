@@ -32,10 +32,10 @@ class AnymalDImitationRoughEnvCfg(ImitationRoughEnvCfg):
         )
         
         # 2. Apply a transparent material to the entire USD
-        # self.scene.ghost_robot.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
-        #     diffuse_color=(0.2, 0.5, 0.8), # Holographic blue tint
-        #     opacity=0.4 
-        # )
+        self.scene.ghost_robot.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.2, 0.5, 0.8),  # Holographic blue tint
+            # opacity=0.4 
+        )
 
         if hasattr(self.scene.ghost_robot, "actuators"):
             for actuator_name in self.scene.ghost_robot.actuators.keys():

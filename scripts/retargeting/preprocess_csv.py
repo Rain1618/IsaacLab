@@ -42,7 +42,7 @@ THIGH_NAMES = [
     "back_right_thai",
 ]
 
-TRUNK_NAMES = ["neck_base", "back_middle", "back_end"]
+TRUNK_NAMES = ["neck_base", "back_end"]
 
 
 def _mocap_to_isaac(xyz_src: np.ndarray) -> np.ndarray:
@@ -253,140 +253,68 @@ def mean_quaternion(quats: np.ndarray) -> np.ndarray:
     return mean_q.astype(np.float32)
 
 
-# def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
-#     """Constant root orientation from the regularized thigh configuration.
-
-#     Straight-walk prior: the dog's heading is constant, so we discard
-#     per-frame rotation estimates and instead extract a single heading from
-#     the time-averaged thigh geometry.
-
-#     For each thigh i in {FL, FR, BL, BR} we compute its mean world-frame
-#     offset from the root:
-
-#         d_bar_i = (1/T) * sum_t (p_thigh_i(t) - p_root(t))   in R^3.
-
-#     Because the clip is a straight walk with (by assumption) constant
-#     heading, these mean offsets span the canonical body-frame hip rectangle
-#     rotated by the unknown heading R. Forward and lateral axes follow from
-#     the rectangle:
-
-#         f_hat = normalize( mean(d_FL, d_FR) - mean(d_BL, d_BR) )   # +x body
-#         l_hat = normalize( mean(d_FL, d_BL) - mean(d_FR, d_BR) )   # +y body
-
-#     We project (f_hat, l_hat) onto the horizontal plane before extracting
-#     z_hat = f_hat x l_hat, enforcing the straight-walk assumption that the
-#     heading is a pure yaw (no pitch/roll bias from thigh-swing noise).
-#     The in-plane axes are then re-orthogonalised.
-
-#     This is strictly better-conditioned than neck<->back-end: the four hip
-#     joints form a roughly rigid rectangle, whereas the spine deforms during
-#     locomotion and injects a heading bias.
-#     """
-#     root = estimate_root_pos(keypoints)  # (T, 3), already in IsaacLab z-up
-#     thighs = np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1)  # (T, 4, 3)
-
-#     # Time-averaged thigh offsets from root (FL, FR, BL, BR).
-#     d_bar = (thighs - root[:, None, :]).mean(axis=0)  # (4, 3)
-#     d_fl, d_fr, d_bl, d_br = d_bar[0], d_bar[1], d_bar[2], d_bar[3]
-
-#     fwd = 0.5 * (d_fl + d_fr) - 0.5 * (d_bl + d_br)   # front - back
-#     lat = - 0.5 * (d_fl + d_bl) + 0.5 * (d_fr + d_br)   # right - left
-
-#     # Straight-walk prior: heading is a pure yaw. Kill any z component in
-#     # the in-plane axes before building the frame so noise in thigh height
-#     # cannot tilt the body (no pitch/roll bias).
-#     fwd[2] = 0.0
-#     lat[2] = 0.0
-#     fwd = fwd / np.clip(np.linalg.norm(fwd), 1e-8, None)
-#     lat = lat / np.clip(np.linalg.norm(lat), 1e-8, None)
-
-#     z_axis = np.cross(fwd, lat)
-#     z_axis = z_axis / np.clip(np.linalg.norm(z_axis), 1e-8, None)   # +z world
-#     y_axis = np.cross(z_axis, fwd)                                   # re-orthog. left
-#     y_axis = y_axis / np.clip(np.linalg.norm(y_axis), 1e-8, None)
-
-#     R_single = np.stack([fwd, y_axis, z_axis], axis=-1)[None, :, :]  # (1, 3, 3)
-#     q_single = _rotmat_to_quat_batch(R_single)[0]                    # (4,)
-#     if q_single[0] < 0.0:
-#         q_single = -q_single                                          # canonical sign
-
-#     T = root.shape[0]
-#     return np.broadcast_to(q_single[None, :], (T, 4)).copy().astype(np.float32)
-
-
 def estimate_root_rot(keypoints: dict[str, np.ndarray]) -> np.ndarray:
-    """Constant root orientation from the regularized thigh configuration.
-
+    """Constant root orientation from the time-averaged foot configuration.
+ 
     Straight-walk prior: the dog's heading is constant, so we discard
     per-frame rotation estimates and instead extract a single heading from
-    the time-averaged thigh geometry.
-
-    For each thigh i in {FL, FR, BL, BR} we compute its mean world-frame
+    the time-averaged foot (paw) geometry.
+ 
+    For each foot i in {FL, FR, BL, BR} we compute its mean world-frame
     offset from the root:
-
-        d_bar_i = (1/T) * sum_t (p_thigh_i(t) - p_root(t))   in R^3.
-
-    Because the clip is a straight walk with (by assumption) constant
-    heading, these mean offsets span the canonical body-frame hip rectangle
-    rotated by the unknown heading R. Forward and lateral axes follow from
-    the rectangle:
-
+ 
+        d_bar_i = (1/T) * sum_t (p_foot_i(t) - p_root(t))   in R^3.
+ 
+    Per frame, feet are noisier than hips (swing phase dominates the vertical
+    signal and introduces stride-phase variation in the fore-aft direction),
+    but on a *straight* walk the time-averaged foot positions trace parallel
+    tracks offset laterally by the stance width. Their temporal means
+    therefore span a rectangle whose long axis aligns with the heading, and
+    the averaging operator attenuates per-frame swing noise by ~1/sqrt(T).
+    Forward and lateral axes follow from the rectangle:
+ 
         f_hat = normalize( mean(d_FL, d_FR) - mean(d_BL, d_BR) )   # +x body
         l_hat = normalize( mean(d_FL, d_BL) - mean(d_FR, d_BR) )   # +y body
-
+ 
     We project (f_hat, l_hat) onto the horizontal plane before extracting
     z_hat = f_hat x l_hat, enforcing the straight-walk assumption that the
-    heading is a pure yaw (no pitch/roll bias from thigh-swing noise).
-    The in-plane axes are then re-orthogonalised.
-
-    This is strictly better-conditioned than neck<->back-end: the four hip
-    joints form a roughly rigid rectangle, whereas the spine deforms during
-    locomotion and injects a heading bias.
+    heading is a pure yaw. This projection matters more for feet than for
+    hips: vertical excursion during swing is far larger than anything in the
+    hip signal, and without zeroing the z-component the swing-apex bias in
+    d_bar_i would tilt the body frame. The in-plane axes are then
+    re-orthogonalised.
     """
     root = estimate_root_pos(keypoints)  # (T, 3), already in IsaacLab z-up
-    thighs = np.stack([xyz(keypoints[n]) for n in THIGH_NAMES], axis=1)  # (T, 4, 3)
-    feet = np.stack([xyz(keypoints[n]) for n in FOOT_NAMES], axis=1) 
-
-    print(root.shape)
-    print(feet.shape)
-
-    # Time-averaged thigh offsets from root (FL, FR, BL, BR).
-    d_bar = (thighs - root[:, None, :]).mean(axis=0)  # (4, 3)
+    feet = np.stack([xyz(keypoints[n]) for n in FOOT_NAMES], axis=1)  # (T, 4, 3)
+ 
+    # Time-averaged foot offsets from root (FL, FR, BL, BR).
+    d_bar = (feet - root[:, None, :]).mean(axis=0)  # (4, 3)
     d_fl, d_fr, d_bl, d_br = d_bar[0], d_bar[1], d_bar[2], d_bar[3]
-
-    f_bar = feet - root[:, None, :]
-    f_fl, f_fr, f_bl, f_br = f_bar[:, 0], f_bar[:, 1], f_bar[:, 2], f_bar[:, 3]
-
-    f_fl_grad = np.gradient(f_fl)
-    f_fr_grad = np.gradient(f_fr)
-    f_bl_grad = np.gradient(f_bl)
-    f_br_grad = np.gradient(f_br)
-
-    # MODIFY STARTING FROM HERE TO COMPLETE: 
-
+ 
     fwd = 0.5 * (d_fl + d_fr) - 0.5 * (d_bl + d_br)   # front - back
     lat = - 0.5 * (d_fl + d_bl) + 0.5 * (d_fr + d_br)   # right - left
-
+ 
     # Straight-walk prior: heading is a pure yaw. Kill any z component in
-    # the in-plane axes before building the frame so noise in thigh height
-    # cannot tilt the body (no pitch/roll bias).
+    # the in-plane axes before building the frame so swing-phase vertical
+    # excursion of the feet cannot tilt the body (no pitch/roll bias).
     fwd[2] = 0.0
     lat[2] = 0.0
     fwd = fwd / np.clip(np.linalg.norm(fwd), 1e-8, None)
     lat = lat / np.clip(np.linalg.norm(lat), 1e-8, None)
-
+ 
     z_axis = np.cross(fwd, lat)
     z_axis = z_axis / np.clip(np.linalg.norm(z_axis), 1e-8, None)   # +z world
     y_axis = np.cross(z_axis, fwd)                                   # re-orthog. left
     y_axis = y_axis / np.clip(np.linalg.norm(y_axis), 1e-8, None)
-
+ 
     R_single = np.stack([fwd, y_axis, z_axis], axis=-1)[None, :, :]  # (1, 3, 3)
     q_single = _rotmat_to_quat_batch(R_single)[0]                    # (4,)
     if q_single[0] < 0.0:
         q_single = -q_single                                          # canonical sign
-
+ 
     T = root.shape[0]
     return np.broadcast_to(q_single[None, :], (T, 4)).copy().astype(np.float32)
+ 
 
 
 def extract_foot_positions(keypoints: dict[str, np.ndarray]) -> np.ndarray:
@@ -592,14 +520,8 @@ def csv_to_npz(
         lambda_reg=hip_lambda,
     )
 
-    # --- Second-pass root re-estimation from the corrected thighs. --------
-    # `estimate_root_pos` pegs root-z to the mean thigh height, and
-    # `estimate_root_rot` uses thigh x,y to build the body axes, so both
-    # benefit from the de-noised hips.
     root_pos = smooth_series(estimate_root_pos(keypoints), window=5)
     root_rot = estimate_root_rot(keypoints)
-    # root_rot is already (near-)constant across T; smoothing a constant is a
-    # no-op but we retain the call for pipeline symmetry.
     root_rot = smooth_series(root_rot, window=5)
 
     foot_pos = smooth_series(extract_foot_positions(keypoints), window=5)

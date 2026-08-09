@@ -41,6 +41,16 @@ ROBOT_META = {
             "LH_HAA": 0.0, "LH_HFE": -0.4, "LH_KFE": 0.8,
             "RH_HAA": 0.0, "RH_HFE": -0.4, "RH_KFE": 0.8,
         },
+        # Per-suffix L2 weights on (q - q_default). Because every leg reuses
+        # the same three values, this is symmetric across L/R and front/hind
+        # by construction. HAA is penalised the hardest to keep hips close to
+        # their neutral abduction; HFE/KFE are freer since they drive foot
+        # reach. Override per-run via QuadrupedRetargeter(default_pose_W=...).
+        "default_pose_W_per_suffix": {
+            "HAA": 20.0,
+            "HFE": 2.0,
+            "KFE": 2.0,
+        },
         "leg_length": 0.55,
         "base_height": 0.55,
         "stance_length": 0.70,
@@ -54,6 +64,7 @@ class ReferenceMotion:
     root_pos: np.ndarray
     root_rot: np.ndarray  # wxyz
     foot_pos: np.ndarray
+    thigh_pos: np.ndarray
     root_lin_vel: np.ndarray | None
     root_ang_vel: np.ndarray | None
     dt: float
@@ -129,7 +140,6 @@ def _quat_to_angular_velocity(quats: np.ndarray, dt: float) -> np.ndarray:
         omega[0] = omega[1]
     return omega
 
-
 def load_reference_motion(path: str, fps: float) -> ReferenceMotion:
     p = Path(path)
     if not p.exists():
@@ -152,15 +162,17 @@ def load_reference_motion(path: str, fps: float) -> ReferenceMotion:
     root_pos = _get("root_pos")
     root_rot = ensure_quaternion_continuity(_get("root_rot"))
     foot_pos = _get("foot_pos")
+    thigh_pos = _get("thigh_pos")                      # NEW: required
     root_lin_vel = _get("root_lin_vel", required=False)
     root_ang_vel = _get("root_ang_vel", required=False)
 
-    if root_pos is None or root_rot is None or foot_pos is None:
+    if root_pos is None or root_rot is None or foot_pos is None or thigh_pos is None:
         raise ValueError("Reference motion is missing required arrays.")
 
     T = root_pos.shape[0]
     assert root_rot.shape == (T, 4), f"root_rot must be (T,4), got {root_rot.shape}"
     assert foot_pos.shape == (T, 4, 3), f"foot_pos must be (T,4,3), got {foot_pos.shape}"
+    assert thigh_pos.shape == (T, 4, 3), f"thigh_pos must be (T,4,3), got {thigh_pos.shape}"
 
     dt = 1.0 / fps
     if root_lin_vel is None:
@@ -173,18 +185,24 @@ def load_reference_motion(path: str, fps: float) -> ReferenceMotion:
         root_pos=root_pos,
         root_rot=root_rot,
         foot_pos=foot_pos,
+        thigh_pos=thigh_pos,
         root_lin_vel=root_lin_vel,
         root_ang_vel=root_ang_vel,
         dt=dt,
     )
 
-
 def compute_scale_factors(ref_motion: ReferenceMotion, meta: dict) -> dict:
-    foot_local = world_to_local_points(ref_motion.root_pos, ref_motion.root_rot, ref_motion.foot_pos)
+    # Thigh positions in the animal's body frame (T, 4, 3)
+    thigh_local = world_to_local_points(ref_motion.root_pos, ref_motion.root_rot, ref_motion.thigh_pos)
+    # Mean over time gives a stable per-leg body-frame attachment (4, 3)
+    thigh_local_mean = thigh_local.mean(axis=0)
 
-    lat_animal = np.mean(np.abs(foot_local[:, 0, 1] - foot_local[:, 1, 1]))
-    lon_animal = np.mean(np.abs(foot_local[:, 0, 0] - foot_local[:, 2, 0]))
+    # Lateral: |y| gap between left (idx 0: LF) and right (idx 1: RF) thighs.
+    # Longitudinal: |x| gap between front (idx 0: LF) and hind (idx 2: LH) thighs.
+    lat_animal = float(np.abs(thigh_local_mean[0, 1] - thigh_local_mean[1, 1]))
+    lon_animal = float(np.abs(thigh_local_mean[0, 0] - thigh_local_mean[2, 0]))
 
+    # z still derived from body clearance above the feet.
     mean_foot_h = ref_motion.foot_pos[:, :, 2].mean(axis=1)
     base_h_animal = float(np.median(ref_motion.root_pos[:, 2] - mean_foot_h))
 
@@ -208,7 +226,7 @@ def compute_scale_factors(ref_motion: ReferenceMotion, meta: dict) -> dict:
         "robot_stance_width": robot_width,
     }
     print(
-        "[Scale] "
+        "[Scale] (from thighs) "
         f"animal length≈{lon_animal:.3f}m width≈{lat_animal:.3f}m base_h≈{base_h_animal:.3f}m | "
         f"robot length≈{robot_length:.3f}m width≈{robot_width:.3f}m base_h≈{robot_base_h:.3f}m | "
         f"scale xyz=({sx:.3f}, {sy:.3f}, {sz:.3f})"
@@ -228,6 +246,7 @@ class QuadrupedRetargeter:
         ik_damping: float,
         physics_dt: float,
         num_envs: int,
+        default_pose_W: np.ndarray | dict | None = None,  # NEW
     ):
         self.robot = robot
         self.scene = scene
@@ -256,7 +275,21 @@ class QuadrupedRetargeter:
             leg_names = meta["joint_names"][leg_i * 3: leg_i * 3 + 3]
             self.leg_joint_ids.append([all_joint_names.index(name) for name in leg_names])
 
-        self.foot_body_ids = [all_body_names.index(name) for name in meta["foot_bodies"]]
+        self.foot_body_ids  = [robot.body_names.index(n) for n in meta["foot_bodies"]]
+        self.thigh_body_ids = [robot.body_names.index(n) for n in meta["leg_roots"]]
+
+        # Isaac Lab's Jacobian body axis EXCLUDES the root link on floating-base
+        # articulations too; the "-1 only if fixed_base" logic in solve_frame is
+        # incorrect for ANYmal-D. Precompute the Jacobian-axis indices here.
+        root_link_idx = 0  # ANYmal-D's root body is at index 0
+        self.foot_jac_idx  = [i - 1 if i > root_link_idx else i for i in self.foot_body_ids]
+        self.thigh_jac_idx = [i - 1 if i > root_link_idx else i for i in self.thigh_body_ids]
+
+        print("[IK] body-name resolution:")
+        for leg_i, name in enumerate(meta["foot_bodies"]):
+            print(f"  leg {leg_i} {name:8s}: body_id={self.foot_body_ids[leg_i]:2d}  jac_idx={self.foot_jac_idx[leg_i]:2d}")
+        for leg_i, name in enumerate(meta["leg_roots"]):
+            print(f"  leg {leg_i} {name:8s}: body_id={self.thigh_body_ids[leg_i]:2d}  jac_idx={self.thigh_jac_idx[leg_i]:2d}")
 
         default_map: dict = meta["default_joint_pos"]
 
@@ -275,6 +308,68 @@ class QuadrupedRetargeter:
         self.fixed_root_rot = torch.tensor(
             [[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=device
         ).expand(num_envs, -1).contiguous()
+
+        self.ik_damping = float(ik_damping)  # keep for the augmented DLS
+
+        # ---- Default-pose L2 regulariser -----------------------------------
+        # W is a (num_dofs,) non-negative diagonal. We only ever use W^T W,
+        # so we store w_sq = W**2 directly. `default_pose_W` can be:
+        #   - None                 -> use meta["default_pose_W_per_suffix"].
+        #   - dict {suffix: w}     -> per-suffix scalar, broadcast across legs
+        #                             (L/R symmetric by construction).
+        #   - np.ndarray (12,)     -> explicit per-joint weights.
+        w_vec = self._resolve_default_pose_weights(default_pose_W, meta, all_joint_names)
+        self.default_pose_w_sq = torch.tensor(
+            (w_vec ** 2).astype(np.float32), device=device
+        )  # shape (num_dofs,)
+
+        # Per-leg views (HAA, HFE, KFE) for use inside solve_frame.
+        self.leg_w_sq: list[torch.Tensor] = []
+        for leg_i in range(4):
+            leg_ids = self.leg_joint_ids[leg_i]
+            self.leg_w_sq.append(self.default_pose_w_sq[torch.tensor(leg_ids, device=device)])
+
+        print(
+            "[IK] default-pose L2 weights (diag W) per joint:\n  "
+            + ", ".join(f"{n}={w:.2f}" for n, w in zip(all_joint_names, w_vec))
+        )
+
+    @staticmethod
+    def _resolve_default_pose_weights(
+        default_pose_W, meta: dict, all_joint_names: list[str]
+    ) -> np.ndarray:
+        """Expand a user-provided weight spec into a (num_dofs,) vector
+        aligned with `all_joint_names`. Enforces L/R symmetry when a
+        per-suffix dict is used."""
+        num_dofs = len(all_joint_names)
+
+        if default_pose_W is None:
+            suffix_map = meta.get("default_pose_W_per_suffix", {"HAA": 1.0, "HFE": 1.0, "KFE": 1.0})
+            w = np.zeros(num_dofs, dtype=np.float32)
+            for i, name in enumerate(all_joint_names):
+                suffix = name.split("_")[-1]
+                w[i] = float(suffix_map.get(suffix, 1.0))
+            return w
+
+        if isinstance(default_pose_W, dict):
+            w = np.zeros(num_dofs, dtype=np.float32)
+            for i, name in enumerate(all_joint_names):
+                if name in default_pose_W:                 # exact joint name wins
+                    w[i] = float(default_pose_W[name])
+                else:
+                    suffix = name.split("_")[-1]
+                    w[i] = float(default_pose_W.get(suffix, 0.0))
+            return w
+
+        w = np.asarray(default_pose_W, dtype=np.float32).reshape(-1)
+        if w.shape[0] != num_dofs:
+            raise ValueError(
+                f"default_pose_W array must have length {num_dofs} "
+                f"(one per joint); got {w.shape[0]}."
+            )
+        if np.any(w < 0.0):
+            raise ValueError("default_pose_W must be non-negative.")
+        return w
 
     def _flush_state(self, joint_pos, joint_vel=None):
         if joint_vel is None:
@@ -295,62 +390,103 @@ class QuadrupedRetargeter:
         self.robot.write_root_pose_to_sim(root_state[:, :7])
         self.robot.write_root_velocity_to_sim(root_state[:, 7:])
 
-    def solve_frame(self, root_pos: np.ndarray, root_rot: np.ndarray, foot_pos_local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def solve_frame(
+        self,
+        root_pos: np.ndarray,
+        root_rot: np.ndarray,
+        foot_pos_local: np.ndarray,
+        thigh_pos_local: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
         dev = self.device
         E = self.num_envs
+        lam2 = self.ik_damping ** 2
 
-        # Base is pinned: ignore the per-frame reference root and use the fixed pose.
-        # `foot_pos_local` is already expressed in the *reference* root frame
-        # (from the original root_pos/root_rot), which is exactly what we want
-        # to feed the IK as base-frame targets for the pinned robot.
-        rp = self.fixed_root_pos
-        rr = self.fixed_root_rot
+        # Base is pinned.
+        fixed_rp = self.fixed_root_pos
+        fixed_rr = self.fixed_root_rot
+
+        # helpers.py: solve_frame — fix rank-2 expansion
+        rp = torch.tensor(root_pos, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
+        rr = torch.tensor(root_rot, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1)
 
         foot_local = torch.tensor(foot_pos_local, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1, -1)
+        thigh_local = torch.tensor(thigh_pos_local, dtype=torch.float32, device=dev).unsqueeze(0).expand(E, -1, -1)
 
-        # Hard-pin the base every frame so physics / Jacobians see the fixed pose.
         self._teleport_base(rp, rr)
 
         jpos = self.default_qpos.clone()
         jvel = torch.zeros_like(jpos)
         self._flush_state(jpos, jvel)
 
+        # Default joint positions as a reusable tensor view.
+        q_def = self.default_qpos  # (E, num_dofs)
+
         for _ in range(self.ik_iters):
             jacobian_full = self.robot.root_physx_view.get_jacobians()
 
             for leg_i in range(4):
-                ctrl = self.ik_controllers[leg_i]
-                leg_ids = self.leg_joint_ids[leg_i]
+                leg_ids = self.leg_joint_ids[leg_i]           # [HAA, HFE, KFE]
+                haa_id = leg_ids[0]
+                hfe_kfe_ids = leg_ids[1:]
                 foot_id = self.foot_body_ids[leg_i]
-                body_idx = foot_id - 1 if self.is_fixed_base else foot_id
+                thigh_id = self.thigh_body_ids[leg_i]
+                foot_body_idx  = self.foot_jac_idx[leg_i]
+                thigh_body_idx = self.thigh_jac_idx[leg_i]
 
-                # get the end-effector pose in the world frame -> base frame
+                leg_w_sq = self.leg_w_sq[leg_i]               # (3,) ordered as leg_ids
+
+                # ---- (1) THIGH TARGET: HAA-only augmented DLS --------------
+                thigh_pos_w = self.robot.data.body_pos_w[:, thigh_id, :]
+                thigh_quat_w = self.robot.data.body_quat_w[:, thigh_id, :]
+                thigh_pos_b, _ = subtract_frame_transforms(rp, rr, thigh_pos_w, thigh_quat_w)
+
+                J_haa = jacobian_full[:, thigh_body_idx, :3, :][:, :, [haa_id]]    # (E, 3, 1)
+                err_thigh = (thigh_local[:, leg_i, :] - thigh_pos_b).unsqueeze(-1)  # (E, 3, 1)
+
+                w_sq_haa = leg_w_sq[0]                         # scalar weight^2 for HAA
+                q_dev_haa = (jpos[:, [haa_id]] - q_def[:, [haa_id]]).unsqueeze(-1)  # (E, 1, 1)
+
+                # A = J^T J + (lambda^2 + w^2) I,   size (E, 1, 1)
+                A = torch.matmul(J_haa.transpose(1, 2), J_haa) + (lam2 + w_sq_haa) * torch.eye(1, device=dev).unsqueeze(0)
+                # b = J^T e - w^2 (q - q_def)
+                b = torch.matmul(J_haa.transpose(1, 2), err_thigh) - w_sq_haa * q_dev_haa
+                dq_haa = torch.linalg.solve(A, b).squeeze(-1)                         # (E, 1)
+                jpos[:, haa_id] = jpos[:, haa_id] + dq_haa[:, 0]
+
+                lo_haa = self.robot.data.soft_joint_pos_limits[:, haa_id, 0]
+                hi_haa = self.robot.data.soft_joint_pos_limits[:, haa_id, 1]
+                jpos[:, haa_id] = torch.clamp(jpos[:, haa_id], lo_haa, hi_haa)
+
+                # ---- (2) FOOT TARGET: HFE+KFE augmented DLS ---------------
                 ee_pos_w = self.robot.data.body_pos_w[:, foot_id, :]
                 ee_quat_w = self.robot.data.body_quat_w[:, foot_id, :]
-                ee_pos_b, ee_quat_b = subtract_frame_transforms(rp, rr, ee_pos_w, ee_quat_w)
+                ee_pos_b, _ = subtract_frame_transforms(rp, rr, ee_pos_w, ee_quat_w)
 
-                # print(f"[INFO] Leg: {self.meta['joint_names'][leg_i]}, {foot_local[:, leg_i, :]}")
-            
                 target_pos_b = foot_local[:, leg_i, :]
-                ctrl.set_command(target_pos_b, ee_quat=ee_quat_b)
+                err_foot = (target_pos_b - ee_pos_b).unsqueeze(-1)                     # (E, 3, 1)
 
-                leg_jpos = jpos[:, leg_ids]
-                leg_dof_ids = torch.tensor(leg_ids, device=dev, dtype=torch.long)
-                J = jacobian_full[:, body_idx, :, :][:, :, leg_dof_ids]
+                hfe_kfe_dof_ids = torch.tensor(hfe_kfe_ids, device=dev, dtype=torch.long)
+                J_foot = jacobian_full[:, foot_body_idx, :3, :][:, :, hfe_kfe_dof_ids]  # (E, 3, 2)
 
-                jpos[:, leg_ids] = ctrl.compute(ee_pos_b, ee_quat_b, J, leg_jpos)
+                W_sub = leg_w_sq[1:]                                                   # (2,) HFE, KFE
+                W_diag = torch.diag(W_sub).unsqueeze(0).expand(E, -1, -1)              # (E, 2, 2)
+                q_dev_sub = (jpos[:, hfe_kfe_ids] - q_def[:, hfe_kfe_ids]).unsqueeze(-1)  # (E, 2, 1)
 
-                lo = self.robot.data.soft_joint_pos_limits[:, leg_ids, 0]
-                hi = self.robot.data.soft_joint_pos_limits[:, leg_ids, 1]
-                jpos[:, leg_ids] = torch.clamp(jpos[:, leg_ids], lo, hi)
+                I2 = torch.eye(2, device=dev).unsqueeze(0)
+                A = torch.matmul(J_foot.transpose(1, 2), J_foot) + lam2 * I2 + W_diag  # (E, 2, 2)
+                b = torch.matmul(J_foot.transpose(1, 2), err_foot) - torch.matmul(W_diag, q_dev_sub)
+                dq_sub = torch.linalg.solve(A, b).squeeze(-1)                          # (E, 2)
+                jpos[:, hfe_kfe_ids] = jpos[:, hfe_kfe_ids] + dq_sub
+
+                lo = self.robot.data.soft_joint_pos_limits[:, hfe_kfe_ids, 0]
+                hi = self.robot.data.soft_joint_pos_limits[:, hfe_kfe_ids, 1]
+                jpos[:, hfe_kfe_ids] = torch.clamp(jpos[:, hfe_kfe_ids], lo, hi)
 
             self._teleport_base(rp, rr)
             self._flush_state(jpos, jvel)
 
         self.robot.update(self.physics_dt)
 
-        print(f"[INFO] Finished Solving Frame")
-        
         return (
             jpos[0].detach().cpu().numpy().astype(np.float32),
             self.robot.data.joint_vel[0].detach().cpu().numpy().astype(np.float32),

@@ -27,6 +27,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ik_iterations", type=int, default=20)
     p.add_argument("--visualise", action="store_true", default=False)
     p.add_argument("--plot_skeleton", action="store_true", default=False)
+    p.add_argument(
+        "--pose-weight-haa", type=float, default=20.0,
+        help="L2 weight penalising HAA deviation from default joint pos (L/R symmetric).",
+    )
+    p.add_argument(
+        "--pose-weight-hfe", type=float, default=2.0,
+        help="L2 weight penalising HFE deviation from default joint pos.",
+    )
+    p.add_argument(
+        "--pose-weight-kfe", type=float, default=2.0,
+        help="L2 weight penalising KFE deviation from default joint pos.",
+    )
     return p
 
 
@@ -175,30 +187,28 @@ def smooth_signal(x: np.ndarray, window: int = 7) -> np.ndarray:
 def build_scaled_targets(root_pos: np.ndarray,
                          root_rot: np.ndarray,
                          foot_pos: np.ndarray,
+                         thigh_pos: np.ndarray,
                          meta: dict,
                          scale: dict,
-                         height_offset: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (scaled_root_pos, root_rot, scaled_foot_pos_world, foot_local_scaled).
-
-    `foot_local_scaled` is expressed in the *original* reference root frame
-    (from the un-modified root_pos / root_rot) so that feet motion stays
-    relative to the dog's body even when the robot base is pinned.
-    """
+                         height_offset: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (scaled_root_pos, root_rot, scaled_foot_pos_world,
+                foot_local_scaled, thigh_local_scaled)."""
     root_rot = ensure_quaternion_continuity(root_rot)
 
-    # Feet relative to the ORIGINAL reference root frame.
     foot_local_ref = world_to_local_points(root_pos, root_rot, foot_pos)
+    thigh_local_ref = world_to_local_points(root_pos, root_rot, thigh_pos)
 
     foot_local_scaled = foot_local_ref.copy()
     foot_local_scaled[..., 0] *= scale["x"]
     foot_local_scaled[..., 1] *= scale["y"]
     foot_local_scaled[..., 2] *= scale["z"]
-    # foot_local_scaled[..., 2] = np.clip(foot_local_scaled[..., 2], -meta["leg_length"] * 1.05, -0.02)
 
-    # Kept for visualization / logging: world-frame feet under the (original)
-    # reference root, lifted by the robot's base height + offset.
+    thigh_local_scaled = thigh_local_ref.copy()
+    thigh_local_scaled[..., 0] *= scale["x"]
+    thigh_local_scaled[..., 1] *= scale["y"]
+    thigh_local_scaled[..., 2] *= scale["z"]
+
     scaled_root_pos = root_pos.astype(np.float32).copy()
-
     scaled_foot_pos_world = local_to_world_points(scaled_root_pos, root_rot, foot_local_scaled)
 
     return (
@@ -206,6 +216,7 @@ def build_scaled_targets(root_pos: np.ndarray,
         root_rot.astype(np.float32),
         scaled_foot_pos_world.astype(np.float32),
         foot_local_scaled.astype(np.float32),
+        thigh_local_scaled.astype(np.float32),
     )
 
 def compute_kinematics_from_positions(joint_pos: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
@@ -228,13 +239,13 @@ def run_targeting(args) -> None:
     if num_envs != 1:
         raise ValueError("Retarget export currently expects --num_envs 1.")
 
-    print("\n[Retarget] Initializing...")
+    print("\n[INFO] Initializing...")
     ref = load_reference_motion(args.ref_motion, args.fps)
     meta = ROBOT_META[args.robot]
     scale = compute_scale_factors(ref, meta)
-    
-    scaled_root_pos, scaled_root_rot, scaled_foot_pos_world, scaled_foot_pos_local = build_scaled_targets(
-        ref.root_pos, ref.root_rot, ref.foot_pos, meta, scale, args.height_offset
+
+    scaled_root_pos, scaled_root_rot, scaled_foot_pos_world, scaled_foot_pos_local, scaled_thigh_pos_local = build_scaled_targets(
+        ref.root_pos, ref.root_rot, ref.foot_pos, ref.thigh_pos, meta, scale, args.height_offset
     )
     # NOTE: scaled_foot_pos_local is in the ORIGINAL reference root frame,
     # so the feet move relative to the (pinned) robot body exactly as they
@@ -249,6 +260,8 @@ def run_targeting(args) -> None:
     if args.visualise:
         sim.set_camera_view(eye=[2.5, 2.0, 1.6], target=[0.0, 0.0, 0.45])
         matplotlib.use("TkAgg")
+
+    print(f"[INFO] matplotlib setup complete...")
 
     robot_cfg = get_robot_cfg(args.robot)
     scene_cfg = RetargetSceneCfg(num_envs=num_envs, env_spacing=2.0)
@@ -275,6 +288,11 @@ def run_targeting(args) -> None:
         robot=robot, scene=scene, sim=sim, meta=meta, device=device,
         ik_iterations=args.ik_iterations, ik_damping=args.ik_damping,
         physics_dt=args.physics_dt, num_envs=num_envs,
+        default_pose_W={
+            "HAA": args.pose_weight_haa,
+            "HFE": args.pose_weight_hfe,
+            "KFE": args.pose_weight_kfe,
+        },
     )
 
     T = ref.root_pos.shape[0]
@@ -289,9 +307,11 @@ def run_targeting(args) -> None:
     out_root_rot = np.tile(
         np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (T, 1)
     )
-    
+
+    # out_root_rot = scaled_root_rot
     out_joint_pos = np.zeros((T, len(isaac_joint_names)), dtype=np.float32)
     out_foot_pos = np.zeros((T, 4, 3), dtype=np.float32)
+    out_thigh_pos = np.zeros((T, 4, 3), dtype=np.float32)
 
     skeleton_plotter = None
     if args.plot_skeleton:
@@ -309,12 +329,16 @@ def run_targeting(args) -> None:
                 root_pos=out_root_pos[t],
                 root_rot=out_root_rot[t],
                 foot_pos_local=scaled_foot_pos_local[t],
+                thigh_pos_local=scaled_thigh_pos_local[t],
             )
-            print(f"{out_root_pos[t]}")
             out_joint_pos[t] = jpos
             robot.update(args.physics_dt)
+
             for leg_i, foot_id in enumerate(retargeter.foot_body_ids):
                 out_foot_pos[t, leg_i] = robot.data.body_pos_w[0, foot_id].detach().cpu().numpy()
+
+            for leg_i, thigh_id in enumerate(retargeter.thigh_body_ids):
+                out_thigh_pos[t, leg_i] = robot.data.body_pos_w[0, thigh_id].detach().cpu().numpy()
 
             if foot_markers is not None:
                 # Targets in world frame under the pinned base: translate by
@@ -354,6 +378,7 @@ def run_targeting(args) -> None:
         joint_pos_isaac=out_joint_pos,
         joint_vel=out_joint_vel,
         joint_acc=out_joint_acc,
+        thigh_pos=out_thigh_pos,
         foot_pos=out_foot_pos,
         foot_pos_local=scaled_foot_pos_local.astype(np.float32),
         frame_duration=np.array(ref.dt, dtype=np.float32),
@@ -368,7 +393,10 @@ def run_targeting(args) -> None:
         scale_y=np.array(scale["y"], dtype=np.float32),
         scale_z=np.array(scale["z"], dtype=np.float32),
     )
+
     print(f"[Retarget] Saved retargeted trajectory -> '{out_path}'")
+
+    return
 
 
 if __name__ == "__main__":
