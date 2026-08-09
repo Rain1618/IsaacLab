@@ -809,61 +809,133 @@ cannot fix without camera intrinsics we do not have.
 \vskip 0.1in
 \centering
 \includegraphics[width=\columnwidth]{images/fig_root_motion.pdf}
-\caption{How far forward the body travels over the clip. Our estimate wobbles
-once per stride and finishes roughly where it started, while the foot contacts
-in the same clip imply the dog covered several metres.}
+\caption{Root motion of the training population, recorded over 200 PPO
+iterations with 64 parallel environments. \textbf{(top)} Mean per-episode
+forward displacement, measured in the frame fixed at each episode's reset
+heading, against the commanded displacement and against the reference, which
+is identically zero. \textbf{(middle)} Travel ratio: net forward displacement
+divided by the path length actually covered. \textbf{(bottom)} The
+world-frame $x$ displacement consumed by the implemented displacement reward,
+plotted against the heading-aligned measurement above.}
 \label{fig:root}
 \vskip -0.1in
 \end{figure}
- 
-Figure~\ref{fig:isaac} shows the reference and the trained policy side by side
-at four points in the stride. The coordination transferred. The legs lift and
-land in the right order, the diagonal pairing is there, and the fraction of the
-stride each foot spends on the ground is within \tbd{X}\% of the reference.
-Watching it from the side, it looks like a walking robot.
- 
-It is not walking. Over a \tbd{20}\,s episode the base moves forward by
-\tbd{$0.0 \pm 0.0$}\,m. The robot cycles its legs against the ground and stays
-in place.
- 
-Our first instinct was that the policy had gotten stuck, and we spent time on
-reward weights and learning rates on that assumption. That was the wrong
-diagnosis. The policy is doing exactly what we asked it to do. Our reward
-(Eq.~\eqref{eq:reward}) compares twelve joint angles against twelve reference
-joint angles and looks at nothing else. The reference is a list of joint angles
-and nothing else. There is no term anywhere in the objective that can tell the
-difference between a robot that travels and a robot that does not, so walking
-in place is not a local optimum the policy failed to escape. It is the correct
-answer to the question we asked.
- 
-Figure~\ref{fig:root} shows why the reference has no body motion in it. We do
-have an estimate of where the body is, but it oscillates by about
-\tbd{0.035}\,m once per stride and finishes \tbd{0.03}\,m behind where it
-started, while integrating the foot contacts over the same clip implies the dog
-covered about \tbd{3.5}\,m. The estimate is not just noisy, it is wrong in a
-way that repeats exactly once per stride, which is a strong hint about the
-cause: we estimate the body position from the same body keypoints whose motion
-we are trying to measure against it, so the legs leak straight into the answer.
- 
-There is a related detail in our own code that is worth mentioning, because it
-makes the same point from a different direction. At the start of each episode
-we randomise where in the stride the robot begins and snap its joints to the
-matching reference pose. We never reset the body position or orientation, only
-the joints. That was not an oversight we caught late; there is no reference
-body position to reset to. The gap shows up in the reward, in the reference,
-and in the initialisation, because they are all reading from the same missing
-field.
- 
+
+The first two checks concerned the reference. This one concerns what the
+policy does with it. To answer that we had to instrument the training loop,
+because the quantity we care about is not one the loop was recording: for
+every environment and every episode we log the displacement of the base in
+the frame fixed at that episode's reset, the arc length the base actually
+travels, and the world-frame displacement that the reward itself consumes.
+
+\paragraph{The reference carries no root field.} Before interpreting any
+policy behaviour it is worth stating plainly what the reference contains. In
+the retargeted clip the root position is written as the constant
+$(0, 0, 0.5)$ for all 643 frames: the range on every axis is exactly zero, and
+the training script never reads the field in any case. This is a stronger
+statement than Check~1's. It is not that we estimated the root and the
+estimate came out small; it is that no root estimate reaches the policy at
+all. Where we did carry an estimate forward, in an earlier version of the
+clip, it was dominated by exactly the artefact we would expect: a net
+displacement of $0.048$\,m over $16.6$\,s of footage sitting underneath a
+$0.377$\,m gait-locked oscillation, a signal-to-artefact ratio of roughly
+$1{:}8$. Either way, the reference specifies a gait and says nothing about
+travel.
+
+\paragraph{What the policy does.} Figure~\ref{fig:root} reports the result. We
+should correct an expectation we held going in, and which an earlier draft of
+this section asserted: we expected the robot to step in place, and it does
+not. Over a $20$\,s episode the base covers $5.5$\,m of path. It is mobile.
+What it does not do is get anywhere. Net forward displacement is
+$0.62 \pm 1.44$\,m against $10$\,m commanded, the travel ratio is $0.23$ and
+falling over the course of training, and mean lateral displacement
+($1.11$\,m) exceeds mean forward displacement ($0.62$\,m). The standard
+deviation is more than twice the mean, so the forward figure is not
+distinguishable from a random walk with a slight bias. The distinction
+matters for diagnosis: a stationary robot suggests a policy that has found a
+degenerate optimum, whereas a mobile robot with a travel ratio near zero
+suggests a policy that is being asked to move without being told where.
+
+\paragraph{The displacement term does not supply the missing signal.} That
+term exists precisely to compensate for the absent root reference, and it
+carries the largest single weight in our objective ($w_{\text{disp}} = 0.70$
+against $w_{\text{pos}} = 0.05$). The bottom panel of Figure~\ref{fig:root}
+shows what it actually measures. Over the same episodes in which the
+heading-aligned displacement holds steady near $0.62$\,m, the world-frame $x$
+displacement the reward consumes reads $-0.07$\,m rising to $+0.18$\,m with a
+standard deviation of $1.63$\,m: zero-mean to within a tenth of its own
+spread. The cause is structural rather than statistical. Reset yaw is drawn
+uniformly on $[-\pi, \pi)$ and the velocity command steers each environment
+toward a uniformly drawn target heading, while the reward credits progress
+along a single fixed world axis. A robot walking correctly at $0.5$\,m\,s$^{-1}$
+while facing $-x$ is penalised exactly as much as an identical robot facing
+$+x$ is rewarded, so the term averages to nothing across the population. Two
+further properties compound this: the displacement is compared against a
+command expressed in the body frame, and it is a function of a ten-step
+history that never enters the observation, so the critic cannot represent the
+quantity whose reward it is asked to predict.
+
+\paragraph{Why this argues for root recovery rather than a better surrogate.}
+The natural response is to repair the surrogate --- measure displacement in
+the body frame, subtract the environment origin, fix the heading. We think
+this is worth doing and we think it is not sufficient, for a reason that is
+visible in the structure of the objective rather than in any measurement. A
+locomotion objective can obtain directed-progress signal from two places: from
+the reference, through an imitation term on root state, or from the task,
+through a velocity or displacement term. Our pipeline has the first absent by
+construction and the second, as implemented, uninformative. Repairing the
+second converts the situation from \emph{no signal} into \emph{two terms that
+disagree}. The imitation term is maximised by reproducing a reference whose
+root is a constant, which is to say by not travelling; the task term is
+maximised by travelling. The policy is then left to trade off two objectives
+that cannot both be satisfied, and the trade-off point is set by weights we
+chose rather than by anything in the data. This is the sense in which root
+recovery is not one improvement among several. It is the only intervention
+that makes the imitation objective and the locomotion objective point in the
+same direction, because it is the only one that puts travel into the
+reference. Every downstream term we might add is either silent about
+displacement or in competition with an imitation target that is silent about
+it.
+
+The same missing field shows up a third time, in initialisation. At each reset
+we randomise the gait phase and snap the joints to the matching reference
+pose, but we never reset the base pose or twist. This was not an oversight:
+there is no reference root state to reset from. Reward, reference, and
+initialisation are all reading from the same absent column.
+
+\paragraph{What these numbers do not establish.} We state the limits of the
+above deliberately, because the measurement is preliminary in three respects
+and we would rather flag them than have them read as oversights. First, the
+run is $200$ PPO iterations from a randomly initialised policy, which is far
+short of convergence; it characterises the objective's early gradient signal,
+not the behaviour of a trained controller. Second, the heading randomisation
+described above is still active in this run, so the heading-aligned forward
+displacement under-counts an environment that correctly executes a commanded
+turn, and the travel ratio is depressed for the same reason. Third, and most
+importantly, no control condition has been run. Without configuration~(A),
+the stock velocity-tracking reward, we have not demonstrated that our
+instrumentation and environment can register a high travel ratio at all, and
+without configuration~(C) we have shown the reference lacks root motion and
+that the policy does not travel, but not that the former causes the latter.
+The argument in the preceding paragraph is structural and we believe it
+independently of these runs; the measurements are consistent with it, and
+consistency is all we claim.
+
 \paragraph{Comparing the configurations.} \tbd{Report forward displacement,
-average episode return, and how long the robot survives before falling, for
-configurations (A) through (D), over \tbd{3} seeds.} The comparison that
-matters is (B) against (C). Both use the same video-derived joint angles and
-differ only in whether the reference includes body motion, so if our
-explanation is right, (C) should close most of the gap between (B) and the
-motion-capture reference (D). If it does not, then the problem is somewhere in
-the per-joint reconstruction instead and this section needs rewriting.
+travel ratio, average episode return, and time-to-fall for configurations (A)
+through (D), over \tbd{3} seeds, at convergence rather than at 200
+iterations.} The comparison that matters is (B) against (C). Both use the same
+video-derived joint angles and differ only in whether the reference includes
+body motion, so if our explanation is right, (C) should close most of the gap
+between (B) and the motion-capture reference (D). If it does not, then the
+problem is somewhere in the per-joint reconstruction instead and this section
+needs rewriting.
 % VERIFY: fill this in only after (C) has actually been run. If (C) comes out
 % against the explanation above, say so and revise rather than dropping it.
+% VERIFY: the 200-iteration numbers above are from a smoke-test run
+% (checkpoints/RL_9fd55692). Re-run at 3000 iterations with fixed heading
+% before submission and update 0.62/1.44/0.23/5.5 and the bottom-panel
+% figures accordingly.
  
 % ---------------------------------------------------------------------
 \subsection{Summary of the Three Checks}
@@ -872,13 +944,19 @@ Check~1 showed that the smoother does what it is supposed to and that the
 extracted gait is structurally correct, but that it cannot touch the slow scale
 drift underneath. Check~2 showed that the unknown scale costs us up to
 \tbd{18}$^\circ$ at the knees and pushes \tbd{12}\% of foot targets outside the
-robot's reach. Check~3 showed that none of that is the reason the robot fails
-to walk. It fails to walk because the reference contains no body motion, so
-nothing in training ever asks it to travel.
- 
+robot's reach. Check~3 showed that none of that is the reason the robot makes
+no progress. It moves --- $5.5$\,m of path over a $20$\,s episode --- but
+covers only $0.62$\,m of ground, because the reference contains no body motion
+and the displacement term meant to stand in for it measures along a fixed
+world axis under uniformly random heading, so nothing in training reliably
+asks it to travel in any particular direction.
+
 The order matters here. The first two problems are real and we should fix them,
 but fixing either one would not change the outcome, because the third problem
-is not a matter of degree. It is a missing field.
+is not a matter of degree. It is a missing field. Nor, we argue in Check~3, is
+it one that a better-engineered task reward removes: repairing the
+displacement term makes the reference's silence about travel into an explicit
+conflict rather than resolving it.
 
 
 \section{Discussion}
