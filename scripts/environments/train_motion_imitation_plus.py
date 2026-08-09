@@ -575,6 +575,103 @@ class PPOBuffer:
                 self.logps.reshape(-1), self.values.reshape(-1))
 
 
+class RootMotionTracker:
+    """
+    Diagnostic-only tracker for how far the robot base actually travels.
+
+    root_state_w mixes in the per-env grid origin, and reset_base randomizes
+    yaw every episode, so raw world-frame x (what the disp_vel reward term
+    uses) is not a meaningful displacement measure across resets. This
+    tracks displacement in the frame heading-aligned at each env's most
+    recent reset, alongside the raw world-x quantity for comparison.
+    Does not feed the reward — see scripts/environments/root_motion_plan.md.
+    """
+
+    def __init__(self, num_envs: int, device, history: int = 200):
+        self.device = device
+        self.p0 = torch.zeros(num_envs, 2, device=device)
+        self.yaw0 = torch.zeros(num_envs, device=device)
+        self.worldx0 = torch.zeros(num_envs, device=device)
+        self.prev_xy = torch.zeros(num_envs, 2, device=device)
+        self.prev_worldx = torch.zeros(num_envs, device=device)
+        self.arc_len = torch.zeros(num_envs, device=device)
+        self.cmd_disp = torch.zeros(num_envs, device=device)
+        self.episodes = deque(maxlen=history)
+
+    def reset(self, env_ids: torch.Tensor, xy_world: torch.Tensor,
+              yaw: torch.Tensor, worldx: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        self.p0[env_ids] = xy_world[env_ids]
+        self.yaw0[env_ids] = yaw[env_ids]
+        self.worldx0[env_ids] = worldx[env_ids]
+        self.prev_xy[env_ids] = xy_world[env_ids]
+        self.prev_worldx[env_ids] = worldx[env_ids]
+        self.arc_len[env_ids] = 0.0
+        self.cmd_disp[env_ids] = 0.0
+
+    def _local_disp(self, xy_world: torch.Tensor, worldx: torch.Tensor):
+        d = xy_world - self.p0
+        cy, sy = torch.cos(-self.yaw0), torch.sin(-self.yaw0)
+        d_fwd = d[:, 0] * cy - d[:, 1] * sy
+        d_lat = d[:, 0] * sy + d[:, 1] * cy
+        return d_fwd, d_lat, worldx - self.worldx0
+
+    def step(self, xy_world: torch.Tensor, worldx: torch.Tensor,
+              vel_cmd_x: torch.Tensor, dt: float, done_mask: torch.Tensor):
+        """Call once per control step, for all envs, with pose read right
+        after env.step(). ManagerBasedRLEnv.step() auto-resets terminated
+        envs internally before returning, so for envs in done_mask, xy_world
+        /worldx here are already the *post-reset* teleported pose, not the
+        terminal pose of the episode that just ended. We therefore only
+        accumulate arc_len/cmd_disp/prev_* for envs that did NOT reset this
+        step, and compute the finished episode's displacement from the last
+        pre-reset pose (self.prev_xy/self.prev_worldx, saved on the previous
+        call). The caller must invoke reset() for done_ids right after this
+        returns, using a fresh pose read (which will now correctly reflect
+        the post-reset state)."""
+        live = ~done_mask
+        if live.any():
+            self.arc_len[live] += torch.linalg.norm(
+                xy_world[live] - self.prev_xy[live], dim=-1)
+            self.cmd_disp[live] += vel_cmd_x[live] * dt
+            self.prev_xy[live] = xy_world[live].clone()
+            self.prev_worldx[live] = worldx[live].clone()
+
+        done_ids = done_mask.nonzero(as_tuple=False).flatten()
+        if done_ids.numel() > 0:
+            d_fwd, d_lat, d_worldx = self._local_disp(self.prev_xy, self.prev_worldx)
+            for i in done_ids.tolist():
+                self.episodes.append({
+                    "disp_fwd": d_fwd[i].item(),
+                    "disp_lat": d_lat[i].item(),
+                    "disp_worldx": d_worldx[i].item(),
+                    "arc_len": self.arc_len[i].item(),
+                    "cmd_disp": self.cmd_disp[i].item(),
+                })
+        return done_ids
+
+    def summary(self):
+        if not self.episodes:
+            return None
+        keys = self.episodes[0].keys()
+        arr = {k: np.array([e[k] for e in self.episodes]) for k in keys}
+        travel_ratio = np.abs(arr["disp_fwd"]) / np.clip(arr["arc_len"], 1e-6, None)
+        tracking_ratio = np.abs(arr["disp_fwd"]) / np.clip(np.abs(arr["cmd_disp"]), 1e-6, None)
+        return {
+            "disp_fwd_mean": float(arr["disp_fwd"].mean()),
+            "disp_fwd_std": float(arr["disp_fwd"].std()),
+            "disp_lat_mean": float(arr["disp_lat"].mean()),
+            "disp_worldx_mean": float(arr["disp_worldx"].mean()),
+            "disp_worldx_std": float(arr["disp_worldx"].std()),
+            "path_len_mean": float(arr["arc_len"].mean()),
+            "travel_ratio_mean": float(travel_ratio.mean()),
+            "cmd_disp_mean": float(arr["cmd_disp"].mean()),
+            "tracking_ratio_mean": float(tracking_ratio.mean()),
+            "n_episodes": len(self.episodes),
+        }
+
+
 def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
     import copy
     # Create a frozen copy of the BC policy for regularization
@@ -616,11 +713,26 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
     rew_log = deque(maxlen=200)
     best_return = -float("inf")
 
+    # Root-motion diagnostic (does not feed the reward) — see
+    # scripts/environments/root_motion_plan.md. Tracks base displacement in
+    # a frame anchored at each env's most recent reset, since root_state_w
+    # mixes in the per-env grid origin and reset yaw is randomized.
+    env_origins_xy = env.unwrapped.scene.env_origins[:, :2]
+    root_tracker = RootMotionTracker(num_envs, device)
+    all_env_ids = torch.arange(num_envs, device=device)
+    root_tracker.reset(
+        all_env_ids,
+        robot.data.root_pos_w[:, :2] - env_origins_xy,
+        robot.data.heading_w,
+        robot.data.root_pos_w[:, 0],
+    )
+
     history_iters = []
     history_ret = []
     history_pg = []
     history_vf = []
     history_comps = {}
+    history_root = {}
 
     print(f"\n[PPO] {args_cli.rl_iters} iters  "
           f"σ_pos={args_cli.sigma_pos}  σ_vel={args_cli.sigma_vel}")
@@ -697,6 +809,18 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
                 # disp_vel in m/s: net forward progress over the window
                 disp_vel = (pos_x_buf[:, -1] - pos_x_buf[:, 0]) / (disp_horizon * sim_dt)
 
+                # Root-motion diagnostic: root_pos_w for envs done this step already
+                # reflects Isaac Lab's internal auto-reset (see ManagerBasedRLEnv.step),
+                # so their displacement is computed from last step's pre-reset pose
+                # inside RootMotionTracker.step rather than from cur_x above.
+                root_tracker.step(
+                    robot.data.root_pos_w[:, :2] - env_origins_xy,
+                    cur_x,
+                    obs_t[:, 9],
+                    sim_dt,
+                    done.bool(),
+                )
+
                 reward, comps = compute_reward(
                     q_cur, qd_cur, q_ref, qd_ref, obs_t,
                     prev_action=prev_acts,
@@ -725,6 +849,13 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
                     reset_idx = done.bool()
                     if reset_idx.any():
                         pos_x_buf[reset_idx] = robot.data.root_state_w[reset_idx, 0:1]
+                        reset_ids = reset_idx.nonzero(as_tuple=False).flatten()
+                        root_tracker.reset(
+                            reset_ids,
+                            robot.data.root_pos_w[:, :2] - env_origins_xy,
+                            robot.data.heading_w,
+                            robot.data.root_pos_w[:, 0],
+                        )
                     for r in ep_return[done.bool()]:
                         ep_returns.append(r.item())
                     ep_return[done.bool()] = 0.0
@@ -813,12 +944,24 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
                 comp_str = ""
             warmup_flag = " [VF_WARMUP]" if in_vf_warmup else ""
             bc_w_cur = bc_reg_weight * max(args_cli.bc_reg_floor, 1.0 - it / 1000.0)
-            fwd_ratio = np.mean([1.0 if r.get("fwd_vel", 0) > 0.05 else 0.0 for r in rew_log])
-            back_ratio = np.mean([1.0 if r.get("back_pen", 0) > 0.05 else 0.0 for r in rew_log])
+
+            root_summary = root_tracker.summary()
+            if root_summary is not None:
+                for k, v in root_summary.items():
+                    history_root.setdefault(k, []).append(v)
+                history_root.setdefault("iter", []).append(it)
+                root_str = (
+                    f"disp_fwd={root_summary['disp_fwd_mean']:+.3f}±{root_summary['disp_fwd_std']:.3f}m  "
+                    f"travel_ratio={root_summary['travel_ratio_mean']:.2f}  "
+                    f"worldx={root_summary['disp_worldx_mean']:+.3f}±{root_summary['disp_worldx_std']:.3f}m"
+                )
+            else:
+                root_str = "no completed episodes yet"
+
             tqdm.write(
                 f"iter {it:5d}{warmup_flag}  ret={mean_ret:.3f}  best={best_return:.3f}  "
                 f"pg={pg_l / n_up:.4f}  vf={vf_l / n_up:.4f}  bc_w={bc_w_cur:.3f} | {comp_str} "
-                f"fwd_ratio={fwd_ratio:.2f}  back_ratio={back_ratio:.2f}"
+                f"| root: {root_str}"
             )
     try:
         import matplotlib
@@ -860,6 +1003,78 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
         print(f"\n[PPO] Plotting failed: {e}")
 
     try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        root_iters = history_root.get("iter", [])
+        if not root_iters:
+            raise RuntimeError("no completed episodes were recorded — nothing to plot")
+
+        fwd_mean = np.array(history_root["disp_fwd_mean"])
+        fwd_std = np.array(history_root["disp_fwd_std"])
+        worldx_mean = np.array(history_root["disp_worldx_mean"])
+        worldx_std = np.array(history_root["disp_worldx_std"])
+        travel_ratio = np.array(history_root["travel_ratio_mean"])
+        episode_len_s = getattr(env.unwrapped.cfg, "episode_length_s", 20.0)
+        try:
+            vx_lo, vx_hi = env.unwrapped.command_manager._terms["base_velocity"].cfg.ranges.lin_vel_x
+            cmd_vx_mid = 0.5 * (vx_lo + vx_hi)
+        except Exception:
+            cmd_vx_mid = 0.5
+        cmd_disp_ref = cmd_vx_mid * episode_len_s
+
+        fig, axs = plt.subplots(3, 1, figsize=(10, 12))
+
+        # (a) Heading-aligned forward displacement per episode, vs commanded and vs
+        # the reference (which has zero root motion by construction).
+        axs[0].plot(root_iters, fwd_mean, label="mean episode fwd. displacement", color="tab:blue")
+        axs[0].fill_between(root_iters, fwd_mean - fwd_std, fwd_mean + fwd_std,
+                             color="tab:blue", alpha=0.2, label="±1 std across episodes")
+        axs[0].axhline(cmd_disp_ref, color="tab:green", linestyle="--",
+                        label=f"commanded ({cmd_disp_ref:.1f} m over {episode_len_s:.0f}s)")
+        axs[0].axhline(0.0, color="tab:red", linestyle="-",
+                        label="reference root motion (= 0, hardcoded)")
+        axs[0].set_title("Average Root Motion: Forward Displacement per Episode")
+        axs[0].set_ylabel("Displacement (m)")
+        axs[0].grid(True)
+        axs[0].legend()
+
+        # (b) Travel ratio: |net forward displacement| / path length. ~1 = walks
+        # somewhere, ~0 = legs cycle while the body stays put.
+        axs[1].plot(root_iters, travel_ratio, color="tab:purple", label="travel ratio")
+        axs[1].axhline(1.0, color="gray", linestyle="--", label="fully directed travel")
+        axs[1].axhline(0.0, color="tab:red", linestyle="-", label="stepping in place")
+        axs[1].set_ylim(-0.05, 1.05)
+        axs[1].set_title("Travel Ratio: |net forward disp.| / path length")
+        axs[1].set_ylabel("Ratio")
+        axs[1].grid(True)
+        axs[1].legend()
+
+        # (c) The reward's own displacement signal (raw world-x, contaminated by
+        # env-grid origin and reset-yaw randomization) vs the heading-aligned
+        # measure above — shows whether disp_vel tracks real progress or noise.
+        axs[2].plot(root_iters, worldx_mean, label="disp_vel metric (raw world-x)", color="tab:orange")
+        axs[2].fill_between(root_iters, worldx_mean - worldx_std, worldx_mean + worldx_std,
+                             color="tab:orange", alpha=0.2)
+        axs[2].plot(root_iters, fwd_mean, label="heading-aligned fwd. displacement", color="tab:blue")
+        axs[2].axhline(0.0, color="gray", linestyle=":")
+        axs[2].set_title("disp_vel Reward Signal vs. Heading-Aligned Displacement")
+        axs[2].set_xlabel("Iteration")
+        axs[2].set_ylabel("Displacement (m)")
+        axs[2].grid(True)
+        axs[2].legend()
+
+        fig.tight_layout()
+        for ext in ("png", "pdf"):
+            root_plot_path = os.path.join(args_cli.save_dir, f"fig_root_motion.{ext}")
+            fig.savefig(root_plot_path, dpi=120, bbox_inches="tight")
+        print(f"[PPO] Root motion plot saved → {os.path.join(args_cli.save_dir, 'fig_root_motion.[png|pdf]')}")
+        plt.close()
+    except Exception as e:
+        print(f"[PPO] Root motion plotting failed: {e}")
+
+    try:
         import csv
         csv_path = os.path.join(args_cli.save_dir, "ppo_metrics.csv")
         with open(csv_path, mode="w", newline="") as f:
@@ -885,6 +1100,19 @@ def train_ppo(env, clip, policy, value_net, device, is_resume: bool = False):
         print(f"[PPO] Training metrics CSV saved → {csv_path}")
     except Exception as e:
         print(f"[PPO] CSV export failed: {e}")
+
+    try:
+        import csv
+        root_csv_path = os.path.join(args_cli.save_dir, "root_motion.csv")
+        with open(root_csv_path, mode="w", newline="") as f:
+            keys = [k for k in history_root if k != "iter"]
+            writer = csv.writer(f)
+            writer.writerow(["iteration"] + keys)
+            for i in range(len(history_root.get("iter", []))):
+                writer.writerow([history_root["iter"][i]] + [history_root[k][i] for k in keys])
+        print(f"[PPO] Root motion CSV saved → {root_csv_path}")
+    except Exception as e:
+        print(f"[PPO] Root motion CSV export failed: {e}")
 
 
 def debug_reward(env, clip, device):
